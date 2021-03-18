@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +19,6 @@
 
 import * as _ from 'lodash';
 import * as chai from 'chai';
-import * as nock from 'nock';
 import * as sinon from 'sinon';
 import * as sinonChai from 'sinon-chai';
 import * as chaiAsPromised from 'chai-as-promised';
@@ -26,12 +26,10 @@ import * as chaiAsPromised from 'chai-as-promised';
 import * as utils from '../utils';
 import * as mocks from '../../resources/mocks';
 
-import {InstanceId} from '../../../src/instance-id/instance-id';
-import {FirebaseInstanceIdRequestHandler} from '../../../src/instance-id/instance-id-request';
-import {FirebaseApp} from '../../../src/firebase-app';
-import {FirebaseInstanceIdError, InstanceIdClientErrorCode} from '../../../src/utils/error';
-
-import * as validator from '../../../src/utils/validator';
+import { InstanceId } from '../../../src/instance-id/instance-id';
+import { FirebaseInstanceIdRequestHandler } from '../../../src/instance-id/instance-id-request-internal';
+import { FirebaseApp } from '../../../src/firebase-app';
+import { FirebaseInstanceIdError, InstanceIdClientErrorCode } from '../../../src/utils/error';
 
 chai.should();
 chai.use(sinonChai);
@@ -43,24 +41,22 @@ describe('InstanceId', () => {
   let iid: InstanceId;
   let mockApp: FirebaseApp;
   let mockCredentialApp: FirebaseApp;
+  let getTokenStub: sinon.SinonStub;
 
   let nullAccessTokenClient: InstanceId;
   let malformedAccessTokenClient: InstanceId;
   let rejectedPromiseAccessTokenClient: InstanceId;
 
-  let googleCloudProject: string;
-  let gcloudProject: string;
+  let googleCloudProject: string | undefined;
+  let gcloudProject: string | undefined;
 
   const noProjectIdError = 'Failed to determine project ID for InstanceId. Initialize the SDK '
   + 'with service account credentials or set project ID as an app option. Alternatively set the '
   + 'GOOGLE_CLOUD_PROJECT environment variable.';
 
-  before(() => utils.mockFetchAccessTokenRequests());
-
-  after(() => nock.cleanAll());
-
   beforeEach(() => {
     mockApp = mocks.app();
+    getTokenStub = utils.stubGetAccessToken(undefined, mockApp);
     mockCredentialApp = mocks.mockCredentialApp();
     iid = new InstanceId(mockApp);
 
@@ -73,6 +69,7 @@ describe('InstanceId', () => {
   });
 
   afterEach(() => {
+    getTokenStub.restore();
     process.env.GOOGLE_CLOUD_PROJECT = googleCloudProject;
     process.env.GCLOUD_PROJECT = gcloudProject;
     return mockApp.delete();
@@ -97,13 +94,13 @@ describe('InstanceId', () => {
       }).to.throw('First argument passed to admin.instanceId() must be a valid Firebase app instance.');
     });
 
-    it('should throw given an invalid credential without project ID', () => {
+    it('should reject given an invalid credential without project ID', () => {
       // Project ID not set in the environment.
       delete process.env.GOOGLE_CLOUD_PROJECT;
       delete process.env.GCLOUD_PROJECT;
-      expect(() => {
-        return new InstanceId(mockCredentialApp);
-      }).to.throw(noProjectIdError);
+      const instanceId = new InstanceId(mockCredentialApp);
+      return instanceId.deleteInstanceId('iid')
+        .should.eventually.rejectedWith(noProjectIdError);
     });
 
     it('should not throw given a valid app', () => {
@@ -165,10 +162,10 @@ describe('InstanceId', () => {
 
     it('should resolve without errors on success', () => {
       const stub = sinon.stub(FirebaseInstanceIdRequestHandler.prototype, 'deleteInstanceId')
-        .returns(Promise.resolve(null));
+        .resolves();
       stubs.push(stub);
       return iid.deleteInstanceId(testInstanceId)
-        .then((result) => {
+        .then(() => {
           // Confirm underlying API called with expected parameters.
           expect(stub).to.have.been.calledOnce.and.calledWith(testInstanceId);
         });
@@ -180,7 +177,7 @@ describe('InstanceId', () => {
         .returns(Promise.reject(expectedError));
       stubs.push(stub);
       return iid.deleteInstanceId(testInstanceId)
-        .then((result) => {
+        .then(() => {
           throw new Error('Unexpected success');
         }, (error) => {
           // Confirm underlying API called with expected parameters.

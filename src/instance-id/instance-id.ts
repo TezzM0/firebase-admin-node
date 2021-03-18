@@ -1,5 +1,5 @@
 /*!
- * Copyright 2017 Google Inc.
+ * Copyright 2020 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,31 +14,29 @@
  * limitations under the License.
  */
 
-import {FirebaseApp} from '../firebase-app';
-import {FirebaseInstanceIdError, InstanceIdClientErrorCode} from '../utils/error';
-import {FirebaseServiceInterface, FirebaseServiceInternalsInterface} from '../firebase-service';
-import {FirebaseInstanceIdRequestHandler} from './instance-id-request';
-
-import * as utils from '../utils/index';
+import { FirebaseApp } from '../firebase-app';
+import { FirebaseInstanceIdError, InstanceIdClientErrorCode } from '../utils/error';
+import { FirebaseInstanceIdRequestHandler } from './instance-id-request-internal';
+import { instanceId } from './index';
 import * as validator from '../utils/validator';
 
-/**
- * Internals of an InstanceId service instance.
- */
-class InstanceIdInternals implements FirebaseServiceInternalsInterface {
-  /**
-   * Deletes the service and its associated resources.
-   *
-   * @return {Promise<()>} An empty Promise that will be fulfilled when the service is deleted.
-   */
-  public delete(): Promise<void> {
-    // There are no resources to clean up
-    return Promise.resolve(undefined);
-  }
-}
+import InstanceIdInterface = instanceId.InstanceId;
 
-export class InstanceId implements FirebaseServiceInterface {
-  public INTERNAL: InstanceIdInternals = new InstanceIdInternals();
+/**
+ * Gets the {@link InstanceId `InstanceId`} service for the
+ * current app.
+ *
+ * @example
+ * ```javascript
+ * var instanceId = app.instanceId();
+ * // The above is shorthand for:
+ * // var instanceId = admin.instanceId(app);
+ * ```
+ *
+ * @return The `InstanceId` service for the
+ *   current app.
+ */
+export class InstanceId implements InstanceIdInterface {
 
   private app_: FirebaseApp;
   private requestHandler: FirebaseInstanceIdRequestHandler;
@@ -55,32 +53,26 @@ export class InstanceId implements FirebaseServiceInterface {
       );
     }
 
-    const projectId: string = utils.getProjectId(app);
-    if (!validator.isNonEmptyString(projectId)) {
-      // Assert for an explicit projct ID (either via AppOptions or the cert itself).
-      throw new FirebaseInstanceIdError(
-        InstanceIdClientErrorCode.INVALID_PROJECT_ID,
-        'Failed to determine project ID for InstanceId. Initialize the '
-        + 'SDK with service account credentials or set project ID as an app option. '
-        + 'Alternatively set the GOOGLE_CLOUD_PROJECT environment variable.',
-      );
-    }
-
     this.app_ = app;
-    this.requestHandler = new FirebaseInstanceIdRequestHandler(app, projectId);
+    this.requestHandler = new FirebaseInstanceIdRequestHandler(app);
   }
 
   /**
-   * Deletes the specified instance ID from Firebase. This can be used to delete an instance ID
-   * and associated user data from a Firebase project, pursuant to the General Data Protection
-   * Regulation (GDPR).
+   * Deletes the specified instance ID and the associated data from Firebase.
    *
-   * @param {string} instanceId The instance ID to be deleted
-   * @return {Promise<void>} A promise that resolves when the instance ID is successfully deleted.
+   * Note that Google Analytics for Firebase uses its own form of Instance ID to
+   * keep track of analytics data. Therefore deleting a Firebase Instance ID does
+   * not delete Analytics data. See
+   * [Delete an Instance ID](/support/privacy/manage-iids#delete_an_instance_id)
+   * for more information.
+   *
+   * @param instanceId The instance ID to be deleted.
+   *
+   * @return A promise fulfilled when the instance ID is deleted.
    */
   public deleteInstanceId(instanceId: string): Promise<void> {
     return this.requestHandler.deleteInstanceId(instanceId)
-      .then((result) => {
+      .then(() => {
         // Return nothing on success
       });
   }

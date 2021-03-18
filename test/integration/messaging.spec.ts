@@ -45,9 +45,29 @@ const message: admin.messaging.Message = {
   notification: {
     title: 'Message title',
     body: 'Message body',
+    imageUrl: 'https://example.com/image.png',
   },
   android: {
     restrictedPackageName: 'com.google.firebase.testing',
+    notification: {
+      title: 'test.title',
+      ticker: 'test.ticker',
+      sticky: true,
+      visibility: 'private',
+      eventTimestamp: new Date(),
+      localOnly: true,
+      priority: 'high',
+      vibrateTimingsMillis: [100, 50, 250],
+      defaultVibrateTimings: false,
+      defaultSound: true,
+      lightSettings: {
+        color: '#AABBCC55',
+        lightOnDurationMillis: 200,
+        lightOffDurationMillis: 300,
+      },
+      defaultLightSettings: false,
+      notificationCount: 1,
+    },
   },
   apns: {
     payload: {
@@ -85,6 +105,56 @@ describe('admin.messaging', () => {
     return admin.messaging().send(message, true)
       .then((name) => {
         expect(name).matches(/^projects\/.*\/messages\/.*$/);
+      });
+  });
+
+  it('sendAll()', () => {
+    const messages: admin.messaging.Message[] = [message, message, message];
+    return admin.messaging().sendAll(messages, true)
+      .then((response) => {
+        expect(response.responses.length).to.equal(messages.length);
+        expect(response.successCount).to.equal(messages.length);
+        expect(response.failureCount).to.equal(0);
+        response.responses.forEach((resp) => {
+          expect(resp.success).to.be.true;
+          expect(resp.messageId).matches(/^projects\/.*\/messages\/.*$/);
+        });
+      });
+  });
+
+  it('sendAll(500)', () => {
+    const messages: admin.messaging.Message[] = [];
+    for (let i = 0; i < 500; i++) {
+      messages.push({ topic: `foo-bar-${i % 10}` });
+    }
+    return admin.messaging().sendAll(messages, true)
+      .then((response) => {
+        expect(response.responses.length).to.equal(messages.length);
+        expect(response.successCount).to.equal(messages.length);
+        expect(response.failureCount).to.equal(0);
+        response.responses.forEach((resp) => {
+          expect(resp.success).to.be.true;
+          expect(resp.messageId).matches(/^projects\/.*\/messages\/.*$/);
+        });
+      });
+  });
+
+  it('sendMulticast()', () => {
+    const multicastMessage: admin.messaging.MulticastMessage = {
+      data: message.data,
+      android: message.android,
+      tokens: ['not-a-token', 'also-not-a-token'],
+    };
+    return admin.messaging().sendMulticast(multicastMessage, true)
+      .then((response) => {
+        expect(response.responses.length).to.equal(2);
+        expect(response.successCount).to.equal(0);
+        expect(response.failureCount).to.equal(2);
+        response.responses.forEach((resp) => {
+          expect(resp.success).to.be.false;
+          expect(resp.messageId).to.be.undefined;
+          expect(resp.error).to.have.property('code', 'messaging/invalid-argument');
+        });
       });
   });
 

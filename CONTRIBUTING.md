@@ -85,6 +85,12 @@ information on using pull requests.
 
 ## <a name="local-setup"></a>Need to get set up locally?
 
+### Prerequisites
+
+1. Node.js 10.10.0 or higher.
+2. NPM 5 or higher (NPM 6 recommended).
+3. Google Cloud SDK ([`gcloud`](https://cloud.google.com/sdk/downloads) utility)
+
 ### Initial Setup
 
 Run the following commands from the command line to get your local environment set up:
@@ -92,13 +98,11 @@ Run the following commands from the command line to get your local environment s
 ```bash
 $ git clone https://github.com/firebase/firebase-admin-node.git
 $ cd firebase-admin-node    # go to the firebase-admin-node directory
-$ npm install -g gulp       # globally install gulp task runner
 $ npm install               # install local npm build / test dependencies
 ```
 
-In order to run the tests, you also need to
-[download the `gcloud` CLI](https://cloud.google.com/sdk/downloads), run the following command, and
-follow the prompts:
+In order to run the tests, you also need to authorize the `gcloud` utility with
+Google application default credentials:
 
 ```bash
 $ gcloud beta auth application-default login
@@ -131,27 +135,71 @@ If you wish to skip the linter, and only run the unit tests:
 $ npm run test:unit
 ```
 
-The integration test suite requires a service account JSON key file, and an API key for a Firebase
-project. Create a new project in the [Firebase console](https://console.firebase.google.com) if
-you do not already have one. Use a separate, dedicated project for integration tests since the
-test suite makes a large number of writes to the Firebase realtime database. Download the service
-account key file from the "Settings > Service Accounts" page of the project, and copy it to
-`test/resources/key.json`. Also obtain the API key for the same project from "Settings > General",
-and save it to `test/resources/apikey.txt`. Finally, to run the integration test suite:
+The integration tests run against an actual Firebase project. Create a new
+project in the [Firebase Console](https://console.firebase.google.com), if you
+do not already have one suitable for running the tests against. Then obtain the
+following credentials from the project:
+
+1. *Service account certificate*: This can be downloaded as a JSON file from
+   the "Settings > Service Accounts" tab of the Firebase console. Copy the
+   file into the repo so it's available at `test/resources/key.json`.
+2. *Web API key*: This is displayed in the "Settings > General" tab of the
+   console. Copy it and save to a new text file at `test/resources/apikey.txt`.
+
+Then set up your Firebase/Google Cloud project as follows:
+
+1. Enable Firestore: Go to the Firebase Console, and select "Database" from
+   the "Develop" menu. Click on the "Create database" button. You may choose
+   to set up Firestore either in the locked mode or in the test mode.
+2. Enable password auth: Select "Authentication" from the "Develop" menu in
+   Firebase Console. Select the "Sign-in method" tab, and enable the
+   "Email/Password" sign-in method, including the Email link (passwordless
+   sign-in) option.
+3. Enable the Firebase ML API: Go to the
+   [Google Developers Console](
+   https://console.developers.google.com/apis/api/firebaseml.googleapis.com/overview)
+   and make sure your project is selected. If the API is not already enabled, click Enable.
+4. Enable the IAM API: Go to the
+   [Google Cloud Console](https://console.cloud.google.com) and make
+   sure your Firebase/Google Cloud project is selected. Select "APIs & Services >
+   Dashboard" from the main menu, and click the "ENABLE APIS AND SERVICES"
+   button. Search for and enable the "Identity and Access Management (IAM)
+   API".
+5. Grant your service account the 'Firebase Authentication Admin' role. This is
+   required to ensure that exported user records contain the password hashes of
+   the user accounts:
+   1. Go to [Google Cloud Console / IAM & admin](https://console.cloud.google.com/iam-admin).
+   2. Find your service account in the list, and click the 'pencil' icon to edit it's permissions.
+   3. Click 'ADD ANOTHER ROLE' and choose 'Firebase Authentication Admin'.
+   4. Click 'SAVE'.
+
+Finally, to run the integration test suite:
 
 ```bash
 $ npm run integration   # Build and run integration test suite
 ```
 
-The integration test suite overwrites the security rules present in your Firebase project. You
-will be prompted before the overwrite takes place:
+By default the integration test suite does not modify the Firebase security rules for the
+Realtime Database. If you want to force update the rules, so that the relevant Database
+integration tests can pass, launch the tests as follows:
 
+```bash
+$ npm run test:integration -- --updateRules
 ```
-Warning: This test will overwrite your project's existing Database rules.
-Overwrite Database rules for tests?
-* 'yes' to agree
-* 'skip' to continue without the overwrite
-* 'no' to cancel
+
+The integration test suite skips the multi-tenancy Auth tests by default.
+If you want to run these tests, an
+[Identity Platform](https://cloud.google.com/identity-platform/) project with multi-tenancy
+[enabled](https://cloud.google.com/identity-platform/docs/multi-tenancy-quickstart#enabling_multi-tenancy)
+will be required.
+An existing Firebase project can be upgraded to an Identity Platform project without
+losing any functionality via the
+[Identity Platform Marketplace Page](https://console.cloud.google.com/customer-identity).
+Note that charges may be incurred for active users beyond the Identity Platform free tier.
+The integration tests can be launched with these tests enabled as follows:
+
+```bash
+$ npm run test:integration -- --testMultiTenancy
 ```
 
 ### Repo Organization

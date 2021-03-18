@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,41 +15,30 @@
  * limitations under the License.
  */
 
-import {FirebaseApp} from '../firebase-app';
-import {FirebaseError} from '../utils/error';
-import {FirebaseServiceInterface, FirebaseServiceInternalsInterface} from '../firebase-service';
-import {ApplicationDefaultCredential, Certificate} from '../auth/credential';
-import * as gcs from '@google-cloud/storage';
-
+import { FirebaseApp } from '../firebase-app';
+import { FirebaseError } from '../utils/error';
+import { ServiceAccountCredential, isApplicationDefault } from '../credential/credential-internal';
+import { Bucket, Storage as StorageClient } from '@google-cloud/storage';
+import * as utils from '../utils/index';
 import * as validator from '../utils/validator';
+import { storage } from './index';
+
+import StorageInterface  = storage.Storage;
 
 /**
- * Internals of a Storage instance.
+ * The default `Storage` service if no
+ * app is provided or the `Storage` service associated with the provided
+ * app.
  */
-class StorageInternals implements FirebaseServiceInternalsInterface {
-  /**
-   * Deletes the service and its associated resources.
-   *
-   * @return {Promise<()>} An empty Promise that will be fulfilled when the service is deleted.
-   */
-  public delete(): Promise<void> {
-    // There are no resources to clean up.
-    return Promise.resolve();
-  }
-}
+export class Storage implements StorageInterface {
 
-/**
- * Storage service bound to the provided app.
- */
-export class Storage implements FirebaseServiceInterface {
-  public INTERNAL: StorageInternals = new StorageInternals();
-
-  private appInternal: FirebaseApp;
-  private storageClient: any;
+  private readonly appInternal: FirebaseApp;
+  private readonly storageClient: StorageClient;
 
   /**
    * @param {FirebaseApp} app The app for this Storage service.
    * @constructor
+   * @internal
    */
   constructor(app: FirebaseApp) {
     if (!validator.isNonNullObject(app) || !('options' in app)) {
@@ -58,32 +48,33 @@ export class Storage implements FirebaseServiceInterface {
       });
     }
 
-    let storage: typeof gcs;
+    let storage: typeof StorageClient;
     try {
-      /* tslint:disable-next-line:no-var-requires */
-      storage = require('@google-cloud/storage');
-    } catch (e) {
+      storage = require('@google-cloud/storage').Storage;
+    } catch (err) {
       throw new FirebaseError({
         code: 'storage/missing-dependencies',
         message: 'Failed to import the Cloud Storage client library for Node.js. '
-          + 'Make sure to install the "@google-cloud/storage" npm package.',
+          + 'Make sure to install the "@google-cloud/storage" npm package. '
+          + `Original error: ${err}`,
       });
     }
 
-    const cert: Certificate = app.options.credential.getCertificate();
-    if (cert != null) {
-      // cert is available when the SDK has been initialized with a service account JSON file,
-      // or by setting the GOOGLE_APPLICATION_CREDENTIALS envrionment variable.
-      this.storageClient = storage({
-        projectId: cert.projectId,
+    const projectId: string | null = utils.getExplicitProjectId(app);
+    const credential = app.options.credential;
+    if (credential instanceof ServiceAccountCredential) {
+      this.storageClient = new storage({
+        // When the SDK is initialized with ServiceAccountCredentials an explicit projectId is
+        // guaranteed to be available.
+        projectId: projectId!,
         credentials: {
-          private_key: cert.privateKey,
-          client_email: cert.clientEmail,
+          private_key: credential.privateKey, // eslint-disable-line @typescript-eslint/camelcase
+          client_email: credential.clientEmail, // eslint-disable-line @typescript-eslint/camelcase
         },
       });
-    } else if (app.options.credential instanceof ApplicationDefaultCredential) {
+    } else if (isApplicationDefault(app.options.credential)) {
       // Try to use the Google application default credentials.
-      this.storageClient = storage();
+      this.storageClient = new storage();
     } else {
       throw new FirebaseError({
         code: 'storage/invalid-credential',
@@ -96,14 +87,12 @@ export class Storage implements FirebaseServiceInterface {
   }
 
   /**
-   * Returns a reference to a Google Cloud Storage bucket. Returned reference can be used to upload
-   * and download content from Google Cloud Storage.
-   *
-   * @param {string=} name Optional name of the bucket to be retrieved. If name is not specified,
-   *   retrieves a reference to the default bucket.
-   * @return {Bucket} A Bucket object from the @google-cloud/storage library.
+   * @param name Optional name of the bucket to be retrieved. If name is not specified,
+   * retrieves a reference to the default bucket.
+   * @returns A [Bucket](https://cloud.google.com/nodejs/docs/reference/storage/latest/Bucket)
+   * instance as defined in the `@google-cloud/storage` package.
    */
-  public bucket(name?: string): gcs.Bucket {
+  public bucket(name?: string): Bucket {
     const bucketName = (typeof name !== 'undefined')
       ? name :  this.appInternal.options.storageBucket;
     if (validator.isNonEmptyString(bucketName)) {
@@ -118,9 +107,7 @@ export class Storage implements FirebaseServiceInterface {
   }
 
   /**
-   * Returns the app associated with this Storage instance.
-   *
-   * @return {FirebaseApp} The app associated with this Storage instance.
+   * @return The app associated with this Storage instance.
    */
   get app(): FirebaseApp {
     return this.appInternal;

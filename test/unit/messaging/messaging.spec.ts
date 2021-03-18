@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,10 +17,6 @@
 
 'use strict';
 
-// Use untyped import syntax for Node built-ins.
-import https = require('https');
-import stream = require('stream');
-
 import * as _ from 'lodash';
 import * as chai from 'chai';
 import * as nock from 'nock';
@@ -30,18 +27,31 @@ import * as chaiAsPromised from 'chai-as-promised';
 import * as utils from '../utils';
 import * as mocks from '../../resources/mocks';
 
-import {FirebaseApp} from '../../../src/firebase-app';
-import {
-  AndroidConfig, Message, Messaging, MessagingOptions, MessagingPayload, MessagingDevicesResponse,
-  MessagingTopicManagementResponse, WebpushConfig,
-  BLACKLISTED_OPTIONS_KEYS, BLACKLISTED_DATA_PAYLOAD_KEYS,
-} from '../../../src/messaging/messaging';
+import { FirebaseApp } from '../../../src/firebase-app';
+import { messaging } from '../../../src/messaging/index';
+import { Messaging } from '../../../src/messaging/messaging';
+import { BLACKLISTED_OPTIONS_KEYS, BLACKLISTED_DATA_PAYLOAD_KEYS } from '../../../src/messaging/messaging-internal';
+import { HttpClient } from '../../../src/utils/api-request';
+import { getSdkVersion } from '../../../src/utils/index';
 
 chai.should();
 chai.use(sinonChai);
 chai.use(chaiAsPromised);
 
 const expect = chai.expect;
+
+import Message = messaging.Message;
+import TokenMessage = messaging.TokenMessage;
+import TopicMessage = messaging.TopicMessage;
+import ConditionMessage = messaging.ConditionMessage;
+import MessagingOptions = messaging.MessagingOptions;
+import MessagingPayload = messaging.MessagingPayload;
+import MessagingDevicesResponse = messaging.MessagingDevicesResponse;
+import MessagingDeviceGroupResponse = messaging.MessagingDeviceGroupResponse
+import MessagingTopicManagementResponse = messaging.MessagingTopicManagementResponse;
+import BatchResponse = messaging.BatchResponse;
+import SendResponse = messaging.SendResponse;
+import MulticastMessage = messaging.MulticastMessage;
 
 // FCM endpoints
 const FCM_SEND_HOST = 'fcm.googleapis.com';
@@ -81,7 +91,63 @@ function mockSendRequest(): nock.Scope {
     });
 }
 
+function mockBatchRequest(ids: string[]): nock.Scope {
+  return mockBatchRequestWithErrors(ids);
+}
+
+function mockBatchRequestWithErrors(ids: string[], errors: object[] = []): nock.Scope {
+  const mockPayload = createMultipartPayloadWithErrors(ids.map((id) => {
+    return { name: id };
+  }), errors);
+  return nock(`https://${FCM_SEND_HOST}:443`)
+    .post('/batch')
+    .reply(200, mockPayload, {
+      'Content-type': 'multipart/mixed; boundary=boundary',
+    });
+}
+
+function createMultipartPayloadWithErrors(
+  success: object[], failures: object[] = []): string {
+
+  const boundary = 'boundary';
+  let payload = '';
+  success.forEach((part) => {
+    payload += `--${boundary}\r\n`;
+    payload += 'Content-type: application/http\r\n\r\n';
+    payload += 'HTTP/1.1 200 OK\r\n';
+    payload += 'Content-type: application/json\r\n\r\n';
+    payload += `${JSON.stringify(part)}\r\n`;
+  });
+  failures.forEach((part) => {
+    payload += `--${boundary}\r\n`;
+    payload += 'Content-type: application/http\r\n\r\n';
+    payload += 'HTTP/1.1 500 Internal Server Error\r\n';
+    payload += 'Content-type: application/json\r\n\r\n';
+    payload += `${JSON.stringify(part)}\r\n`;
+  });
+  payload += `--${boundary}--\r\n`;
+  return payload;
+}
+
 function mockSendError(
+  statusCode: number,
+  errorFormat: 'json' | 'text',
+  responseOverride?: any,
+): nock.Scope {
+  return mockErrorResponse(
+    '/v1/projects/project_id/messages:send', statusCode, errorFormat, responseOverride);
+}
+
+function mockBatchError(
+  statusCode: number,
+  errorFormat: 'json' | 'text',
+  responseOverride?: any,
+): nock.Scope {
+  return mockErrorResponse('/batch', statusCode, errorFormat, responseOverride);
+}
+
+function mockErrorResponse(
+  path: string,
   statusCode: number,
   errorFormat: 'json' | 'text',
   responseOverride?: any,
@@ -97,11 +163,13 @@ function mockSendError(
   }
 
   return nock(`https://${FCM_SEND_HOST}:443`)
-    .post('/v1/projects/project_id/messages:send')
+    .post(path)
     .reply(statusCode, responseOverride || response, {
       'Content-Type': contentType,
     });
 }
+
+/* eslint-disable @typescript-eslint/camelcase */
 
 function mockSendToDeviceStringRequest(mockFailure = false): nock.Scope {
   let deviceResult: object = { message_id: `0:${ mocks.messaging.messageId }` };
@@ -244,50 +312,51 @@ function mockTopicSubscriptionRequestWithError(
     });
 }
 
+function disableRetries(messaging: Messaging): void {
+  (messaging as any).messagingRequestHandler.httpClient.retry = null;
+}
+
+class CustomArray extends Array { }
 
 describe('Messaging', () => {
   let mockApp: FirebaseApp;
   let messaging: Messaging;
-  let mockResponse: stream.PassThrough;
   let mockedRequests: nock.Scope[] = [];
-  let requestWriteSpy: sinon.SinonSpy;
   let httpsRequestStub: sinon.SinonStub;
-  let mockRequestStream: mocks.MockStream;
+  let getTokenStub: sinon.SinonStub;
   let nullAccessTokenMessaging: Messaging;
-  let malformedAccessTokenMessaging: Messaging;
-  let rejectedPromiseAccessTokenMessaging: Messaging;
 
-  before(() => utils.mockFetchAccessTokenRequests());
+  let messagingService: {[key: string]: any};
+  let nullAccessTokenMessagingService: {[key: string]: any};
 
-  after(() => nock.cleanAll());
+  const mockAccessToken: string = utils.generateRandomAccessToken();
+  const expectedHeaders = {
+    'Authorization': 'Bearer ' + mockAccessToken,
+    'X-Firebase-Client': `fire-admin-node/${getSdkVersion()}`,
+    'access_token_auth': 'true',
+  };
+  const emptyResponse = utils.responseFrom({});
+
+  after(() => {
+    nock.cleanAll();
+  });
 
   beforeEach(() => {
     mockApp = mocks.app();
+    getTokenStub = utils.stubGetAccessToken(mockAccessToken, mockApp);
     messaging = new Messaging(mockApp);
-
-    mockResponse = new stream.PassThrough();
-    mockResponse.write(JSON.stringify({ mockResponse: true }));
-    mockResponse.end();
-
-    mockRequestStream = new mocks.MockStream();
-
-    requestWriteSpy = sinon.spy(mockRequestStream, 'write');
-
     nullAccessTokenMessaging = new Messaging(mocks.appReturningNullAccessToken());
-    malformedAccessTokenMessaging = new Messaging(mocks.appReturningMalformedAccessToken());
-    rejectedPromiseAccessTokenMessaging = new Messaging(mocks.appRejectedWhileFetchingAccessToken());
+    messagingService = messaging;
+    nullAccessTokenMessagingService = nullAccessTokenMessaging;
   });
 
   afterEach(() => {
     _.forEach(mockedRequests, (mockedRequest) => mockedRequest.done());
     mockedRequests = [];
-
-    requestWriteSpy.restore();
-
     if (httpsRequestStub && httpsRequestStub.restore) {
       httpsRequestStub.restore();
     }
-
+    getTokenStub.restore();
     return mockApp.delete();
   });
 
@@ -308,6 +377,16 @@ describe('Messaging', () => {
         const messagingAny: any = Messaging;
         return new messagingAny();
       }).to.throw('First argument passed to admin.messaging() must be a valid Firebase app instance.');
+    });
+
+    it('should reject given app without project ID', () => {
+      const appWithoutProjectId = mocks.mockCredentialApp();
+      const messagingWithoutProjectId = new Messaging(appWithoutProjectId);
+      messagingWithoutProjectId.send({ topic: 'test' })
+        .should.eventually.be.rejectedWith(
+          'Failed to determine project ID for Messaging. Initialize the SDK with service '
+          + 'account credentials or set project ID as an app option. Alternatively set the '
+          + 'GOOGLE_CLOUD_PROJECT environment variable.');
     });
 
     it('should not throw given a valid app', () => {
@@ -333,15 +412,15 @@ describe('Messaging', () => {
   describe('send()', () => {
     it('should throw given no message', () => {
       expect(() => {
-        messaging.send(undefined as Message);
+        messaging.send(undefined as any);
       }).to.throw('Message must be a non-null object');
       expect(() => {
-        messaging.send(null);
+        messaging.send(null as any);
       }).to.throw('Message must be a non-null object');
     });
 
     const noTarget = [
-      {}, {token: null}, {token: ''}, {topic: null}, {topic: ''}, {condition: null}, {condition: ''},
+      {}, { token: null }, { token: '' }, { topic: null }, { topic: '' }, { condition: null }, { condition: '' },
     ];
     noTarget.forEach((message) => {
       it(`should throw given message without target: ${ JSON.stringify(message) }`, () => {
@@ -352,10 +431,10 @@ describe('Messaging', () => {
     });
 
     const multipleTargets = [
-      {token: 'a', topic: 'b'},
-      {token: 'a', condition: 'b'},
-      {condition: 'a', topic: 'b'},
-      {token: 'a', topic: 'b', condition: 'c'},
+      { token: 'a', topic: 'b' },
+      { token: 'a', condition: 'b' },
+      { condition: 'a', topic: 'b' },
+      { token: 'a', topic: 'b', condition: 'c' },
     ];
     multipleTargets.forEach((message) => {
       it(`should throw given message without target: ${ JSON.stringify(message)}`, () => {
@@ -369,7 +448,7 @@ describe('Messaging', () => {
     invalidDryRun.forEach((dryRun) => {
       it(`should throw given invalid dryRun parameter: ${JSON.stringify(dryRun)}`, () => {
         expect(() => {
-          messaging.send({token: 'a'}, dryRun as any);
+          messaging.send({ token: 'a' }, dryRun as any);
         }).to.throw('dryRun must be a boolean');
       });
     });
@@ -378,14 +457,14 @@ describe('Messaging', () => {
     invalidTopics.forEach((topic) => {
       it(`should throw given invalid topic name: ${JSON.stringify(topic)}`, () => {
         expect(() => {
-          messaging.send({topic});
+          messaging.send({ topic });
         }).to.throw('Malformed topic name');
       });
     });
 
     const targetMessages = [
-      {token: 'mock-token'}, {topic: 'mock-topic'},
-      {topic: '/topics/mock-topic'}, {condition: '"foo" in topics'},
+      { token: 'mock-token' }, { topic: 'mock-topic' },
+      { topic: '/topics/mock-topic' }, { condition: '"foo" in topics' },
     ];
     targetMessages.forEach((message) => {
       it(`should be fulfilled with a message ID given a valid message: ${JSON.stringify(message)}`, () => {
@@ -414,9 +493,9 @@ describe('Messaging', () => {
       };
       mockedRequests.push(mockSendError(400, 'json', resp));
       return messaging.send(
-        {token: 'mock-token'},
+        { token: 'mock-token' },
       ).should.eventually.be.rejectedWith('test error message')
-       .and.have.property('code', 'messaging/invalid-argument');
+        .and.have.property('code', 'messaging/invalid-argument');
     });
 
     it('should fail when the backend server returns a detailed error with FCM error code', () => {
@@ -426,7 +505,7 @@ describe('Messaging', () => {
           message: 'test error message',
           details: [
             {
-              '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmErrorCode',
+              '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
               'errorCode': 'UNREGISTERED',
             },
           ],
@@ -434,9 +513,31 @@ describe('Messaging', () => {
       };
       mockedRequests.push(mockSendError(404, 'json', resp));
       return messaging.send(
-        {token: 'mock-token'},
+        { token: 'mock-token' },
       ).should.eventually.be.rejectedWith('test error message')
-       .and.have.property('code', 'messaging/registration-token-not-registered');
+        .and.have.property('code', 'messaging/registration-token-not-registered');
+    });
+
+    ['THIRD_PARTY_AUTH_ERROR', 'APNS_AUTH_ERROR'].forEach((errorCode) => {
+      it(`should map ${errorCode} to third party auth error`, () => {
+        const resp = {
+          error: {
+            status: 'INVALID_ARGUMENT',
+            message: 'test error message',
+            details: [
+              {
+                '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
+                'errorCode': errorCode,
+              },
+            ],
+          },
+        };
+        mockedRequests.push(mockSendError(404, 'json', resp));
+        return messaging.send(
+          { token: 'mock-token' },
+        ).should.eventually.be.rejectedWith('test error message')
+          .and.have.property('code', 'messaging/third-party-auth-error');
+      });
     });
 
     it('should map server error code to client-side error', () => {
@@ -448,16 +549,16 @@ describe('Messaging', () => {
       };
       mockedRequests.push(mockSendError(404, 'json', resp));
       return messaging.send(
-        {token: 'mock-token'},
+        { token: 'mock-token' },
       ).should.eventually.be.rejectedWith('test error message')
-       .and.have.property('code', 'messaging/registration-token-not-registered');
+        .and.have.property('code', 'messaging/registration-token-not-registered');
     });
 
     it('should fail when the backend server returns an unknown error', () => {
-      const resp = {error: 'test error message'};
+      const resp = { error: 'test error message' };
       mockedRequests.push(mockSendError(400, 'json', resp));
       return messaging.send(
-        {token: 'mock-token'},
+        { token: 'mock-token' },
       ).should.eventually.be.rejected.and.have.property('code', 'messaging/unknown-error');
     });
 
@@ -465,9 +566,601 @@ describe('Messaging', () => {
       // Error code will be determined based on the status code.
       mockedRequests.push(mockSendError(400, 'text', 'foo bar'));
       return messaging.send(
-        {token: 'mock-token'},
+        { token: 'mock-token' },
       ).should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
     });
+  });
+
+  describe('sendAll()', () => {
+    const validMessage: Message = { token: 'a' };
+
+    function checkSendResponseSuccess(response: SendResponse, messageId: string): void {
+      expect(response.success).to.be.true;
+      expect(response.messageId).to.equal(messageId);
+      expect(response.error).to.be.undefined;
+    }
+
+    function checkSendResponseFailure(response: SendResponse, code: string, msg?: string): void {
+      expect(response.success).to.be.false;
+      expect(response.messageId).to.be.undefined;
+      expect(response.error).to.have.property('code', code);
+      if (msg) {
+        expect(response.error!.toString()).to.contain(msg);
+      }
+    }
+
+    it('should throw given no messages', () => {
+      expect(() => {
+        messaging.sendAll(undefined as any);
+      }).to.throw('messages must be a non-empty array');
+      expect(() => {
+        messaging.sendAll(null as any);
+      }).to.throw('messages must be a non-empty array');
+      expect(() => {
+        messaging.sendAll([]);
+      }).to.throw('messages must be a non-empty array');
+    });
+
+    it('should throw when called with more than 500 messages', () => {
+      const messages: Message[] = [];
+      for (let i = 0; i < 501; i++) {
+        messages.push(validMessage);
+      }
+      expect(() => {
+        messaging.sendAll(messages);
+      }).to.throw('messages list must not contain more than 500 items');
+    });
+
+    it('should reject when a message is invalid', () => {
+      const invalidMessage: Message = {} as any;
+      messaging.sendAll([validMessage, invalidMessage])
+        .should.eventually.be.rejectedWith('Exactly one of topic, token or condition is required');
+    });
+
+    const invalidDryRun = [null, NaN, 0, 1, '', 'a', [], [1, 'a'], {}, { a: 1 }, _.noop];
+    invalidDryRun.forEach((dryRun) => {
+      it(`should throw given invalid dryRun parameter: ${JSON.stringify(dryRun)}`, () => {
+        expect(() => {
+          messaging.sendAll([{ token: 'a' }], dryRun as any);
+        }).to.throw('dryRun must be a boolean');
+      });
+    });
+
+    it('should be fulfilled with a BatchResponse given valid messages', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      mockedRequests.push(mockBatchRequest(messageIds));
+      return messaging.sendAll([validMessage, validMessage, validMessage])
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(3);
+          expect(response.failureCount).to.equal(0);
+          response.responses.forEach((resp, idx) => {
+            expect(resp.success).to.be.true;
+            expect(resp.messageId).to.equal(messageIds[idx]);
+            expect(resp.error).to.be.undefined;
+          });
+        });
+    });
+
+    it('should be fulfilled with a BatchResponse given array-like (issue #566)', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      mockedRequests.push(mockBatchRequest(messageIds));
+      const message = {
+        token: 'a',
+        android: {
+          ttl: 3600,
+        },
+      };
+      const arrayLike = new CustomArray();
+      arrayLike.push(message);
+      arrayLike.push(message);
+      arrayLike.push(message);
+      // Explicitly patch the constructor so that down compiling to ES5 doesn't affect the test.
+      // See https://github.com/firebase/firebase-admin-node/issues/566#issuecomment-501974238
+      // for more context.
+      arrayLike.constructor = CustomArray;
+
+      return messaging.sendAll(arrayLike)
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(3);
+          expect(response.failureCount).to.equal(0);
+          response.responses.forEach((resp, idx) => {
+            expect(resp.success).to.be.true;
+            expect(resp.messageId).to.equal(messageIds[idx]);
+            expect(resp.error).to.be.undefined;
+          });
+        });
+    });
+
+    it('should be fulfilled with a BatchResponse given valid messages in dryRun mode', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      mockedRequests.push(mockBatchRequest(messageIds));
+      return messaging.sendAll([validMessage, validMessage, validMessage], true)
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(3);
+          expect(response.failureCount).to.equal(0);
+          expect(response.responses.length).to.equal(3);
+          response.responses.forEach((resp, idx) => {
+            checkSendResponseSuccess(resp, messageIds[idx]);
+          });
+        });
+    });
+
+    it('should be fulfilled with a BatchResponse when the response contains some errors', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+      ];
+      const errors = [
+        {
+          error: {
+            status: 'INVALID_ARGUMENT',
+            message: 'test error message',
+          },
+        },
+      ];
+      mockedRequests.push(mockBatchRequestWithErrors(messageIds, errors));
+      return messaging.sendAll([validMessage, validMessage, validMessage], true)
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(2);
+          expect(response.failureCount).to.equal(1);
+          expect(response.responses.length).to.equal(3);
+
+          const responses = response.responses;
+          checkSendResponseSuccess(responses[0], messageIds[0]);
+          checkSendResponseSuccess(responses[1], messageIds[1]);
+          checkSendResponseFailure(
+            responses[2], 'messaging/invalid-argument', 'test error message');
+        });
+    });
+
+    it('should expose the FCM error code via BatchResponse', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+      ];
+      const errors = [
+        {
+          error: {
+            status: 'INVALID_ARGUMENT',
+            message: 'test error message',
+            details: [
+              {
+                '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
+                'errorCode': 'UNREGISTERED',
+              },
+            ],
+          },
+        },
+      ];
+      mockedRequests.push(mockBatchRequestWithErrors(messageIds, errors));
+      return messaging.sendAll([validMessage, validMessage], true)
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(1);
+          expect(response.failureCount).to.equal(1);
+          expect(response.responses.length).to.equal(2);
+
+          const responses = response.responses;
+          checkSendResponseSuccess(responses[0], messageIds[0]);
+          checkSendResponseFailure(
+            responses[1], 'messaging/registration-token-not-registered');
+        });
+    });
+
+    it('should fail when the backend server returns a detailed error', () => {
+      const resp = {
+        error: {
+          status: 'INVALID_ARGUMENT',
+          message: 'test error message',
+        },
+      };
+      mockedRequests.push(mockBatchError(400, 'json', resp));
+      return messaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/invalid-argument');
+    });
+
+    it('should fail when the backend server returns a detailed error with FCM error code', () => {
+      const resp = {
+        error: {
+          status: 'INVALID_ARGUMENT',
+          message: 'test error message',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
+              'errorCode': 'UNREGISTERED',
+            },
+          ],
+        },
+      };
+      mockedRequests.push(mockBatchError(404, 'json', resp));
+      return messaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/registration-token-not-registered');
+    });
+
+    it('should map server error code to client-side error', () => {
+      const resp = {
+        error: {
+          status: 'NOT_FOUND',
+          message: 'test error message',
+        },
+      };
+      mockedRequests.push(mockBatchError(404, 'json', resp));
+      return messaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/registration-token-not-registered');
+    });
+
+    it('should fail when the backend server returns an unknown error', () => {
+      const resp = { error: 'test error message' };
+      mockedRequests.push(mockBatchError(400, 'json', resp));
+      return messaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejected.and.have.property('code', 'messaging/unknown-error');
+    });
+
+    it('should fail when the backend server returns a non-json error', () => {
+      // Error code will be determined based on the status code.
+      mockedRequests.push(mockBatchError(400, 'text', 'foo bar'));
+      return messaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
+    });
+
+    it('should be rejected given an app which returns null access tokens', () => {
+      return nullAccessTokenMessaging.sendAll(
+        [validMessage],
+      ).should.eventually.be.rejected.and.have.property('code', 'app/invalid-credential');
+    });
+
+    // This test was added to also verify https://github.com/firebase/firebase-admin-node/issues/1146
+    it('should be fulfilled when called with different message types', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      const tokenMessage: TokenMessage = { token: 'test' };
+      const topicMessage: TopicMessage = { topic: 'test' };
+      const conditionMessage: ConditionMessage = { condition: 'test' };
+      const messages: Message[] = [tokenMessage, topicMessage, conditionMessage];
+      
+      mockedRequests.push(mockBatchRequest(messageIds));
+      
+      return messaging.sendAll(messages)
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(3);
+          expect(response.failureCount).to.equal(0);
+          response.responses.forEach((resp, idx) => {
+            expect(resp.success).to.be.true;
+            expect(resp.messageId).to.equal(messageIds[idx]);
+            expect(resp.error).to.be.undefined;
+          });
+        });
+    });    
+  });
+
+  describe('sendMulticast()', () => {
+    const mockResponse: BatchResponse = {
+      successCount: 3,
+      failureCount: 0,
+      responses: [
+        { success: true, messageId: 'projects/projec_id/messages/1' },
+        { success: true, messageId: 'projects/projec_id/messages/2' },
+        { success: true, messageId: 'projects/projec_id/messages/3' },
+      ],
+    };
+
+    let stub: sinon.SinonStub | null;
+
+    afterEach(() => {
+      if (stub) {
+        stub.restore();
+      }
+      stub = null;
+    });
+
+    it('should throw given no messages', () => {
+      expect(() => {
+        messaging.sendMulticast(undefined as any);
+      }).to.throw('MulticastMessage must be a non-null object');
+      expect(() => {
+        messaging.sendMulticast({} as any);
+      }).to.throw('tokens must be a non-empty array');
+      expect(() => {
+        messaging.sendMulticast({ tokens: [] });
+      }).to.throw('tokens must be a non-empty array');
+    });
+
+    it('should throw when called with more than 500 messages', () => {
+      const tokens: string[] = [];
+      for (let i = 0; i < 501; i++) {
+        tokens.push(`token${i}`);
+      }
+      expect(() => {
+        messaging.sendMulticast({ tokens });
+      }).to.throw('tokens list must not contain more than 500 items');
+    });
+
+    const invalidDryRun = [null, NaN, 0, 1, '', 'a', [], [1, 'a'], {}, { a: 1 }, _.noop];
+    invalidDryRun.forEach((dryRun) => {
+      it(`should throw given invalid dryRun parameter: ${JSON.stringify(dryRun)}`, () => {
+        expect(() => {
+          messaging.sendMulticast({ tokens: ['a'] }, dryRun as any);
+        }).to.throw('dryRun must be a boolean');
+      });
+    });
+
+    it('should create multiple messages using the empty multicast payload', () => {
+      stub = sinon.stub(messaging, 'sendAll').resolves(mockResponse);
+      const tokens = ['a', 'b', 'c'];
+      return messaging.sendMulticast({ tokens })
+        .then((response: BatchResponse) => {
+          expect(response).to.deep.equal(mockResponse);
+          expect(stub).to.have.been.calledOnce;
+          const messages: Message[] = stub!.args[0][0];
+          expect(messages.length).to.equal(3);
+          expect(stub!.args[0][1]).to.be.undefined;
+          messages.forEach((message, idx) => {
+            expect((message as TokenMessage).token).to.equal(tokens[idx]);
+            expect(message.android).to.be.undefined;
+            expect(message.apns).to.be.undefined;
+            expect(message.data).to.be.undefined;
+            expect(message.notification).to.be.undefined;
+            expect(message.webpush).to.be.undefined;
+          });
+        });
+    });
+
+    it('should create multiple messages using the multicast payload', () => {
+      stub = sinon.stub(messaging, 'sendAll').resolves(mockResponse);
+      const tokens = ['a', 'b', 'c'];
+      const multicast: MulticastMessage = {
+        tokens,
+        android: { ttl: 100 },
+        apns: { payload: { aps: { badge: 42 } } },
+        data: { key: 'value' },
+        notification: { title: 'test title' },
+        webpush: { data: { webKey: 'webValue' } },
+        fcmOptions: { analyticsLabel: 'label' },
+      };
+      return messaging.sendMulticast(multicast)
+        .then((response: BatchResponse) => {
+          expect(response).to.deep.equal(mockResponse);
+          expect(stub).to.have.been.calledOnce;
+          const messages: Message[] = stub!.args[0][0];
+          expect(messages.length).to.equal(3);
+          expect(stub!.args[0][1]).to.be.undefined;
+          messages.forEach((message, idx) => {
+            expect((message as TokenMessage).token).to.equal(tokens[idx]);
+            expect(message.android).to.deep.equal(multicast.android);
+            expect(message.apns).to.be.deep.equal(multicast.apns);
+            expect(message.data).to.be.deep.equal(multicast.data);
+            expect(message.notification).to.deep.equal(multicast.notification);
+            expect(message.webpush).to.deep.equal(multicast.webpush);
+            expect(message.fcmOptions).to.deep.equal(multicast.fcmOptions);
+          });
+        });
+    });
+
+    it('should pass dryRun argument through', () => {
+      stub = sinon.stub(messaging, 'sendAll').resolves(mockResponse);
+      const tokens = ['a', 'b', 'c'];
+      return messaging.sendMulticast({ tokens }, true)
+        .then((response: BatchResponse) => {
+          expect(response).to.deep.equal(mockResponse);
+          expect(stub).to.have.been.calledOnce;
+          expect(stub!.args[0][1]).to.be.true;
+        });
+    });
+
+    it('should be fulfilled with a BatchResponse given valid message', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      mockedRequests.push(mockBatchRequest(messageIds));
+      return messaging.sendMulticast({
+        tokens: ['a', 'b', 'c'],
+        android: { ttl: 100 },
+        apns: { payload: { aps: { badge: 42 } } },
+        data: { key: 'value' },
+        notification: { title: 'test title' },
+        webpush: { data: { webKey: 'webValue' } },
+      }).then((response: BatchResponse) => {
+        expect(response.successCount).to.equal(3);
+        expect(response.failureCount).to.equal(0);
+        response.responses.forEach((resp, idx) => {
+          expect(resp.success).to.be.true;
+          expect(resp.messageId).to.equal(messageIds[idx]);
+          expect(resp.error).to.be.undefined;
+        });
+      });
+    });
+
+    it('should be fulfilled with a BatchResponse given valid message in dryRun mode', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+        'projects/projec_id/messages/3',
+      ];
+      mockedRequests.push(mockBatchRequest(messageIds));
+      return messaging.sendMulticast({
+        tokens: ['a', 'b', 'c'],
+        android: { ttl: 100 },
+        apns: { payload: { aps: { badge: 42 } } },
+        data: { key: 'value' },
+        notification: { title: 'test title' },
+        webpush: { data: { webKey: 'webValue' } },
+      }, true).then((response: BatchResponse) => {
+        expect(response.successCount).to.equal(3);
+        expect(response.failureCount).to.equal(0);
+        expect(response.responses.length).to.equal(3);
+        response.responses.forEach((resp, idx) => {
+          checkSendResponseSuccess(resp, messageIds[idx]);
+        });
+      });
+    });
+
+    it('should be fulfilled with a BatchResponse when the response contains some errors', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+        'projects/projec_id/messages/2',
+      ];
+      const errors = [
+        {
+          error: {
+            status: 'INVALID_ARGUMENT',
+            message: 'test error message',
+          },
+        },
+      ];
+      mockedRequests.push(mockBatchRequestWithErrors(messageIds, errors));
+      return messaging.sendMulticast({ tokens: ['a', 'b'] })
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(2);
+          expect(response.failureCount).to.equal(1);
+          expect(response.responses.length).to.equal(3);
+
+          const responses = response.responses;
+          checkSendResponseSuccess(responses[0], messageIds[0]);
+          checkSendResponseSuccess(responses[1], messageIds[1]);
+          checkSendResponseFailure(
+            responses[2], 'messaging/invalid-argument', 'test error message');
+        });
+    });
+
+    it('should expose the FCM error code via BatchResponse', () => {
+      const messageIds = [
+        'projects/projec_id/messages/1',
+      ];
+      const errors = [
+        {
+          error: {
+            status: 'INVALID_ARGUMENT',
+            message: 'test error message',
+            details: [
+              {
+                '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
+                'errorCode': 'UNREGISTERED',
+              },
+            ],
+          },
+        },
+      ];
+      mockedRequests.push(mockBatchRequestWithErrors(messageIds, errors));
+      return messaging.sendMulticast({ tokens: ['a', 'b'] })
+        .then((response: BatchResponse) => {
+          expect(response.successCount).to.equal(1);
+          expect(response.failureCount).to.equal(1);
+          expect(response.responses.length).to.equal(2);
+
+          const responses = response.responses;
+          checkSendResponseSuccess(responses[0], messageIds[0]);
+          checkSendResponseFailure(
+            responses[1], 'messaging/registration-token-not-registered');
+        });
+    });
+
+    it('should fail when the backend server returns a detailed error', () => {
+      const resp = {
+        error: {
+          status: 'INVALID_ARGUMENT',
+          message: 'test error message',
+        },
+      };
+      mockedRequests.push(mockBatchError(400, 'json', resp));
+      return messaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/invalid-argument');
+    });
+
+    it('should fail when the backend server returns a detailed error with FCM error code', () => {
+      const resp = {
+        error: {
+          status: 'INVALID_ARGUMENT',
+          message: 'test error message',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.firebase.fcm.v1.FcmError',
+              'errorCode': 'UNREGISTERED',
+            },
+          ],
+        },
+      };
+      mockedRequests.push(mockBatchError(404, 'json', resp));
+      return messaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/registration-token-not-registered');
+    });
+
+    it('should map server error code to client-side error', () => {
+      const resp = {
+        error: {
+          status: 'NOT_FOUND',
+          message: 'test error message',
+        },
+      };
+      mockedRequests.push(mockBatchError(404, 'json', resp));
+      return messaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejectedWith('test error message')
+        .and.have.property('code', 'messaging/registration-token-not-registered');
+    });
+
+    it('should fail when the backend server returns an unknown error', () => {
+      const resp = { error: 'test error message' };
+      mockedRequests.push(mockBatchError(400, 'json', resp));
+      return messaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejected.and.have.property('code', 'messaging/unknown-error');
+    });
+
+    it('should fail when the backend server returns a non-json error', () => {
+      // Error code will be determined based on the status code.
+      mockedRequests.push(mockBatchError(400, 'text', 'foo bar'));
+      return messaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
+    });
+
+    it('should be rejected given an app which returns null access tokens', () => {
+      return nullAccessTokenMessaging.sendMulticast(
+        { tokens: ['a'] },
+      ).should.eventually.be.rejected.and.have.property('code', 'app/invalid-credential');
+    });
+
+    function checkSendResponseSuccess(response: SendResponse, messageId: string): void {
+      expect(response.success).to.be.true;
+      expect(response.messageId).to.equal(messageId);
+      expect(response.error).to.be.undefined;
+    }
+
+    function checkSendResponseFailure(response: SendResponse, code: string, msg?: string): void {
+      expect(response.success).to.be.false;
+      expect(response.messageId).to.be.undefined;
+      expect(response.error).to.have.property('code', code);
+      if (msg) {
+        expect(response.error!.toString()).to.contain(msg);
+      }
+    }
   });
 
   describe('sendToDevice()', () => {
@@ -486,7 +1179,7 @@ describe('Messaging', () => {
 
     it('should throw given no registration token(s) argument', () => {
       expect(() => {
-        messaging.sendToDevice(undefined as string, mocks.messaging.payloadDataOnly);
+        messaging.sendToDevice(undefined as any, mocks.messaging.payloadDataOnly);
       }).to.throw(invalidArgumentError);
     });
 
@@ -576,6 +1269,7 @@ describe('Messaging', () => {
     _.forEach(STATUS_CODE_TO_ERROR_MAP, (expectedError, statusCode) => {
       it(`should be rejected given a ${ statusCode } text server response`, () => {
         mockedRequests.push(mockSendRequestWithError(parseInt(statusCode, 10), 'text'));
+        disableRetries(messaging);
 
         return messaging.sendToDevice(
           mocks.messaging.registrationToken,
@@ -678,10 +1372,11 @@ describe('Messaging', () => {
           mocks.messaging.registrationToken + '2',
         ],
         mocks.messaging.payload,
-      ).then((response: MessagingDevicesResponse) => {
+      ).then((response: MessagingDevicesResponse | MessagingDeviceGroupResponse) => {
         expect(response).to.have.keys([
           'failureCount', 'successCount', 'canonicalRegistrationTokenCount', 'multicastId', 'results',
         ]);
+        response = response as MessagingDevicesResponse;
         expect(response.failureCount).to.equal(2);
         expect(response.successCount).to.equal(1);
         expect(response.canonicalRegistrationTokenCount).to.equal(1);
@@ -702,17 +1397,15 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             mocks.messaging.payload,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             to: mocks.messaging.registrationToken,
             data: mocks.messaging.payload.data,
@@ -731,17 +1424,15 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             registrationTokens,
             mocks.messaging.payload,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             registration_ids: registrationTokens,
             data: mocks.messaging.payload.data,
@@ -763,6 +1454,9 @@ describe('Messaging', () => {
           mocks.messaging.registrationToken + '0',
           mocks.messaging.registrationToken + '1',
         ],
+        canonicalRegistrationTokenCount: -1,
+        multicastId: -1,
+        results: [],
       });
     });
 
@@ -810,7 +1504,7 @@ describe('Messaging', () => {
 
     it('should throw given no notification key argument', () => {
       expect(() => {
-        messaging.sendToDeviceGroup(undefined as string, mocks.messaging.payloadDataOnly);
+        messaging.sendToDeviceGroup(undefined as any, mocks.messaging.payloadDataOnly);
       }).to.throw(invalidArgumentError);
     });
 
@@ -873,9 +1567,10 @@ describe('Messaging', () => {
     _.forEach(STATUS_CODE_TO_ERROR_MAP, (expectedError, statusCode) => {
       it(`should be rejected given a ${ statusCode } text server response`, () => {
         mockedRequests.push(mockSendRequestWithError(parseInt(statusCode, 10), 'text'));
+        disableRetries(messaging);
 
         return messaging.sendToDeviceGroup(
-        mocks.messaging.notificationKey,
+          mocks.messaging.notificationKey,
           mocks.messaging.payload,
         ).should.eventually.be.rejected.and.have.property('code', expectedError);
       });
@@ -982,16 +1677,14 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDeviceGroup(
             mocks.messaging.notificationKey,
             mocks.messaging.payload,
           );
         }).then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             to: mocks.messaging.notificationKey,
             data: mocks.messaging.payload.data,
@@ -1014,6 +1707,7 @@ describe('Messaging', () => {
         results: [
           { messageId: `0:${ mocks.messaging.messageId }` },
         ],
+        failedRegistrationTokens: [],
       });
     });
 
@@ -1059,7 +1753,7 @@ describe('Messaging', () => {
 
     it('should throw given no topic argument', () => {
       expect(() => {
-        messaging.sendToTopic(undefined as string, mocks.messaging.payload);
+        messaging.sendToTopic(undefined as any, mocks.messaging.payload);
       }).to.throw(invalidArgumentError);
     });
 
@@ -1125,9 +1819,10 @@ describe('Messaging', () => {
     _.forEach(STATUS_CODE_TO_ERROR_MAP, (expectedError, statusCode) => {
       it(`should be rejected given a ${ statusCode } text server response`, () => {
         mockedRequests.push(mockSendRequestWithError(parseInt(statusCode, 10), 'text'));
+        disableRetries(messaging);
 
         return messaging.sendToTopic(
-        mocks.messaging.topic,
+          mocks.messaging.topic,
           mocks.messaging.payload,
         ).should.eventually.be.rejected.and.have.property('code', expectedError);
       });
@@ -1206,16 +1901,14 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToTopic(
             mocks.messaging.topic,
             mocks.messaging.payload,
           );
         }).then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             to: mocks.messaging.topicWithPrefix,
             data: mocks.messaging.payload.data,
@@ -1228,17 +1921,15 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToTopic(
             mocks.messaging.topicWithPrefix,
             mocks.messaging.payload,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             to: mocks.messaging.topicWithPrefix,
             data: mocks.messaging.payload.data,
@@ -1289,7 +1980,7 @@ describe('Messaging', () => {
 
     it('should throw given no condition argument', () => {
       expect(() => {
-        messaging.sendToCondition(undefined as string, mocks.messaging.payloadDataOnly);
+        messaging.sendToCondition(undefined as any, mocks.messaging.payloadDataOnly);
       }).to.throw(invalidArgumentError);
     });
 
@@ -1347,9 +2038,10 @@ describe('Messaging', () => {
     _.forEach(STATUS_CODE_TO_ERROR_MAP, (expectedError, statusCode) => {
       it(`should be rejected given a ${ statusCode } text server response`, () => {
         mockedRequests.push(mockSendRequestWithError(parseInt(statusCode, 10), 'text'));
+        disableRetries(messaging);
 
         return messaging.sendToCondition(
-        mocks.messaging.condition,
+          mocks.messaging.condition,
           mocks.messaging.payload,
         ).should.eventually.be.rejected.and.have.property('code', expectedError);
       });
@@ -1410,17 +2102,15 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToCondition(
             mocks.messaging.condition,
             mocks.messaging.payload,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.deep.equal({
             condition: mocks.messaging.condition,
             data: mocks.messaging.payload.data,
@@ -1462,19 +2152,19 @@ describe('Messaging', () => {
     invalidPayloads.forEach((invalidPayload) => {
       it(`should throw given invalid type for payload argument: ${ JSON.stringify(invalidPayload) }`, () => {
         expect(() => {
-          messaging.sendToDevice(mocks.messaging.registrationToken, invalidPayload as MessagingPayload);
+          messaging.sendToDevice(mocks.messaging.registrationToken, invalidPayload as any);
         }).to.throw('Messaging payload must be an object');
 
         expect(() => {
-          messaging.sendToDeviceGroup(mocks.messaging.notificationKey, invalidPayload as MessagingPayload);
+          messaging.sendToDeviceGroup(mocks.messaging.notificationKey, invalidPayload as any);
         }).to.throw('Messaging payload must be an object');
 
         expect(() => {
-          messaging.sendToTopic(mocks.messaging.topic, invalidPayload as MessagingPayload);
+          messaging.sendToTopic(mocks.messaging.topic, invalidPayload as any);
         }).to.throw('Messaging payload must be an object');
 
         expect(() => {
-          messaging.sendToCondition(mocks.messaging.condition, invalidPayload as MessagingPayload);
+          messaging.sendToCondition(mocks.messaging.condition, invalidPayload as any);
         }).to.throw('Messaging payload must be an object');
       });
     });
@@ -1598,17 +2288,15 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             mocks.messaging.payload,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.have.keys(['to', 'data', 'notification']);
           expect(requestData.data).to.deep.equal(mocks.messaging.payload.data);
           expect(requestData.notification).to.deep.equal(mocks.messaging.payload.notification);
@@ -1619,9 +2307,7 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             {
@@ -1636,8 +2322,8 @@ describe('Messaging', () => {
             },
           );
         }).then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData.notification).to.deep.equal({
             body_loc_args: 'one',
             body_loc_key: 'two',
@@ -1653,9 +2339,7 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             {
@@ -1667,8 +2351,8 @@ describe('Messaging', () => {
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData.notification.body_loc_args).to.equal('foo');
         });
     });
@@ -1683,6 +2367,21 @@ describe('Messaging', () => {
         mockPayloadClone,
       ).then(() => {
         expect(mockPayloadClone).to.deep.equal(mocks.messaging.payload);
+      });
+    });
+
+    const invalidImages = ['', 'a', 'foo', 'image.jpg'];
+    invalidImages.forEach((imageUrl) => {
+      it(`should throw given an invalid imageUrl: ${imageUrl}`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          notification: {
+            imageUrl,
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('notification.imageUrl must be a valid URL string');
       });
     });
 
@@ -1718,6 +2417,22 @@ describe('Messaging', () => {
       });
     });
 
+    invalidImages.forEach((imageUrl) => {
+      it(`should throw given an invalid imageUrl: ${ imageUrl }`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          android: {
+            notification: {
+              imageUrl,
+            },
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('android.notification.imageUrl must be a valid URL string');
+      });
+    });
+
     it('should throw given android titleLocArgs without titleLocKey', () => {
       const message: Message = {
         condition: 'topic-name',
@@ -1746,6 +2461,118 @@ describe('Messaging', () => {
       }).to.throw('bodyLocKey is required when specifying bodyLocArgs');
     });
 
+    const invalidVibrateTimings = [[null, 500], [-100]];
+    invalidVibrateTimings.forEach((vibrateTimingsMillisMaybeNull) => {
+      const vibrateTimingsMillis = vibrateTimingsMillisMaybeNull as number[];
+      it(`should throw given an null or negative vibrateTimingsMillis: ${ vibrateTimingsMillis }`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          android: {
+            notification: {
+              vibrateTimingsMillis,
+            },
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('android.notification.vibrateTimingsMillis must be non-negative durations in milliseconds');
+      });
+    });
+
+    it('should throw given an empty vibrateTimingsMillis array', () => {
+      const message: Message = {
+        condition: 'topic-name',
+        android: {
+          notification: {
+            vibrateTimingsMillis: [],
+          },
+        },
+      };
+      expect(() => {
+        messaging.send(message);
+      }).to.throw('android.notification.vibrateTimingsMillis must be a non-empty array of numbers');
+    });
+
+    invalidColors.forEach((color) => {
+      it(`should throw given an invalid color: ${ color }`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          android: {
+            notification: {
+              lightSettings: {
+                color,
+                lightOnDurationMillis: 100,
+                lightOffDurationMillis: 800,
+              },
+            },
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('android.notification.lightSettings.color must be in the form #RRGGBB or #RRGGBBAA format');
+      });
+    });
+
+    it('should throw given a negative light on duration', () => {
+      const message: Message = {
+        condition: 'topic-name',
+        android: {
+          notification: {
+            lightSettings: {
+              color: '#aabbcc',
+              lightOnDurationMillis: -1,
+              lightOffDurationMillis: 800,
+            },
+          },
+        },
+      };
+      expect(() => {
+        messaging.send(message);
+      }).to.throw(
+        'android.notification.lightSettings.lightOnDurationMillis must be a non-negative duration in milliseconds');
+    });
+
+    it('should throw given a negative light off duration', () => {
+      const message: Message = {
+        condition: 'topic-name',
+        android: {
+          notification: {
+            lightSettings: {
+              color: '#aabbcc',
+              lightOnDurationMillis: 100,
+              lightOffDurationMillis: -800,
+            },
+          },
+        },
+      };
+      expect(() => {
+        messaging.send(message);
+      }).to.throw(
+        'android.notification.lightSettings.lightOffDurationMillis must be a non-negative duration in milliseconds');
+    });
+
+    const invalidVolumes = [-0.1, 1.1];
+    invalidVolumes.forEach((volume) => {
+      it(`should throw given invalid apns sound volume: ${volume}`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  name: 'default',
+                  volume,
+                },
+              },
+            },
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('volume must be in the interval [0, 1]');
+      });
+    });
+
     it('should throw given apns titleLocArgs without titleLocKey', () => {
       const message: Message = {
         condition: 'topic-name',
@@ -1762,6 +2589,24 @@ describe('Messaging', () => {
       expect(() => {
         messaging.send(message);
       }).to.throw('titleLocKey is required when specifying titleLocArgs');
+    });
+
+    it('should throw given apns subtitleLocArgs without subtitleLocKey', () => {
+      const message: Message = {
+        condition: 'topic-name',
+        apns: {
+          payload: {
+            aps: {
+              alert: {
+                subtitleLocArgs: ['foo'],
+              },
+            },
+          },
+        },
+      };
+      expect(() => {
+        messaging.send(message);
+      }).to.throw('subtitleLocKey is required when specifying subtitleLocArgs');
     });
 
     it('should throw given apns locArgs without locKey', () => {
@@ -1786,41 +2631,67 @@ describe('Messaging', () => {
     invalidObjects.forEach((arg) => {
       it(`should throw given invalid android config: ${JSON.stringify(arg)}`, () => {
         expect(() => {
-          messaging.send({android: arg, topic: 'test'});
+          messaging.send({ android: arg, topic: 'test' });
         }).to.throw('android must be a non-null object');
       });
 
       it(`should throw given invalid android notification: ${JSON.stringify(arg)}`, () => {
         expect(() => {
-          messaging.send({android: {notification: arg}, topic: 'test'});
+          messaging.send({ android: { notification: arg }, topic: 'test' });
         }).to.throw('android.notification must be a non-null object');
       });
 
       it(`should throw given invalid apns config: ${JSON.stringify(arg)}`, () => {
         expect(() => {
-          messaging.send({apns: arg, topic: 'test'});
+          messaging.send({ apns: arg, topic: 'test' });
         }).to.throw('apns must be a non-null object');
       });
 
       it(`should throw given invalid webpush config: ${JSON.stringify(arg)}`, () => {
         expect(() => {
-          messaging.send({webpush: arg, topic: 'test'});
+          messaging.send({ webpush: arg, topic: 'test' });
         }).to.throw('webpush must be a non-null object');
       });
 
       it(`should throw given invalid data: ${JSON.stringify(arg)}`, () => {
         expect(() => {
-          messaging.send({data: arg, topic: 'test'});
+          messaging.send({ data: arg, topic: 'test' });
         }).to.throw('data must be a non-null object');
+      });
+
+      it(`should throw given invalid fcmOptions: ${JSON.stringify(arg)}`, () => {
+        expect(() => {
+          messaging.send({ fcmOptions: arg, topic: 'test' });
+        }).to.throw('fcmOptions must be a non-null object');
+      });
+
+      it(`should throw given invalid AndroidFcmOptions: ${JSON.stringify(arg)}`, () => {
+        expect(() => {
+          messaging.send({ android: { fcmOptions: arg }, topic: 'test' });
+        }).to.throw('fcmOptions must be a non-null object');
+      });
+
+      it(`should throw given invalid ApnsFcmOptions: ${JSON.stringify(arg)}`, () => {
+        expect(() => {
+          messaging.send({ apns: { fcmOptions: arg }, topic: 'test' });
+        }).to.throw('fcmOptions must be a non-null object');
       });
     });
 
-    const invalidDataMessages: any = [
-      {label: 'data', message: {data: {k1: true}}},
-      {label: 'android.data', message: {android: {data: {k1: true}}}},
-      {label: 'webpush.data', message: {webpush: {data: {k1: true}}}},
-      {label: 'webpush.headers', message: {webpush: {headers: {k1: true}}}},
-      {label: 'apns.headers', message: {apns: {headers: {k1: true}}}},
+    invalidImages.forEach((imageUrl) => {
+      it('should throw given invalid URL string for imageUrl', () => {
+        expect(() => {
+          messaging.send({ apns: { fcmOptions: { imageUrl } }, topic: 'test' });
+        }).to.throw('imageUrl must be a valid URL string');
+      });
+    });
+
+    const invalidDataMessages: any[] = [
+      { label: 'data', message: { data: { k1: true } } },
+      { label: 'android.data', message: { android: { data: { k1: true } } } },
+      { label: 'webpush.data', message: { webpush: { data: { k1: true } } } },
+      { label: 'webpush.headers', message: { webpush: { headers: { k1: true } } } },
+      { label: 'apns.headers', message: { apns: { headers: { k1: true } } } },
     ];
     invalidDataMessages.forEach((config) => {
       it(`should throw given data with non-string value: ${config.label}`, () => {
@@ -1832,27 +2703,27 @@ describe('Messaging', () => {
       });
     });
 
-    const invalidApnsPayloads: any = [null, '', 'payload', true, 1.23];
+    const invalidApnsPayloads: any[] = [null, '', 'payload', true, 1.23];
     invalidApnsPayloads.forEach((payload) => {
       it(`should throw given APNS payload with invalid object: ${JSON.stringify(payload)}`, () => {
         expect(() => {
-          messaging.send({apns: {payload}, token: 'token'});
+          messaging.send({ apns: { payload }, token: 'token' });
         }).to.throw('apns.payload must be a non-null object');
       });
     });
     invalidApnsPayloads.forEach((aps) => {
       it(`should throw given APNS payload with invalid aps object: ${JSON.stringify(aps)}`, () => {
         expect(() => {
-          messaging.send({apns: {payload: {aps}}, token: 'token'});
+          messaging.send({ apns: { payload: { aps } }, token: 'token' });
         }).to.throw('apns.payload.aps must be a non-null object');
       });
     });
-    it(`should throw given APNS payload with duplicate fields`, () => {
+    it('should throw given APNS payload with duplicate fields', () => {
       expect(() => {
         messaging.send({
           apns: {
             payload: {
-              aps: {'mutableContent': true, 'mutable-content': 1},
+              aps: { 'mutableContent': true, 'mutable-content': 1 },
             },
           },
           token: 'token',
@@ -1860,12 +2731,38 @@ describe('Messaging', () => {
       }).to.throw('Multiple specifications for mutableContent in Aps');
     });
 
-    const invalidApnsAlerts: any = [null, [], true, 1.23];
+    const invalidApnsAlerts: any[] = [null, [], true, 1.23];
     invalidApnsAlerts.forEach((alert) => {
       it(`should throw given APNS payload with invalid aps alert: ${JSON.stringify(alert)}`, () => {
         expect(() => {
-          messaging.send({apns: {payload: {aps: {alert}}}, token: 'token'});
+          messaging.send({ apns: { payload: { aps: { alert } } }, token: 'token' });
         }).to.throw('apns.payload.aps.alert must be a string or a non-null object');
+      });
+    });
+
+    const invalidApnsSounds: any[] = ['', null, [], true, 1.23];
+    invalidApnsSounds.forEach((sound) => {
+      it(`should throw given APNS payload with invalid aps sound: ${JSON.stringify(sound)}`, () => {
+        expect(() => {
+          messaging.send({ apns: { payload: { aps: { sound } } }, token: 'token' });
+        }).to.throw('apns.payload.aps.sound must be a non-empty string or a non-null object');
+      });
+    });
+    invalidApnsSounds.forEach((name) => {
+      it(`should throw given invalid APNS critical sound name: ${name}`, () => {
+        const message: Message = {
+          condition: 'topic-name',
+          apns: {
+            payload: {
+              aps: {
+                sound: { name },
+              },
+            },
+          },
+        };
+        expect(() => {
+          messaging.send(message);
+        }).to.throw('apns.payload.aps.sound.name must be a non-empty string');
       });
     });
   });
@@ -1922,9 +2819,9 @@ describe('Messaging', () => {
 
     const whitelistedOptionsKeys: {
       [name: string]: {
-        type: string,
-        underscoreCasedKey?: string,
-      },
+        type: string;
+        underscoreCasedKey?: string;
+      };
     } = {
       dryRun: { type: 'boolean', underscoreCasedKey: 'dry_run' },
       priority: { type: 'string' },
@@ -1936,8 +2833,8 @@ describe('Messaging', () => {
     };
 
     _.forEach(whitelistedOptionsKeys, ({ type, underscoreCasedKey }, camelCasedKey) => {
-      let validValue;
-      let invalidValues;
+      let validValue: any;
+      let invalidValues: Array<{value: any; text: string}>;
       if (type === 'string') {
         invalidValues = [
           { value: true, text: 'non-string' },
@@ -2029,9 +2926,7 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             mocks.messaging.payloadDataOnly,
@@ -2039,8 +2934,8 @@ describe('Messaging', () => {
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.have.keys(['to', 'data', 'dry_run', 'collapse_key']);
           expect(requestData.dry_run).to.equal(mockOptionsClone.dryRun);
           expect(requestData.collapse_key).to.equal(mockOptionsClone.collapseKey);
@@ -2067,6 +2962,22 @@ describe('Messaging', () => {
           notification: {
             title: 'test.title',
             body: 'test.body',
+            imageUrl: 'https://example.com/image.png',
+          },
+        },
+        expectedReq: {
+          notification: {
+            title: 'test.title',
+            body: 'test.body',
+            image: 'https://example.com/image.png',
+          },
+        },
+      },
+      {
+        label: 'Generic fcmOptions message',
+        req: {
+          fcmOptions: {
+            analyticsLabel: 'test.analytics',
           },
         },
       },
@@ -2092,6 +3003,26 @@ describe('Messaging', () => {
               color: '#112233',
               sound: 'test.sound',
               tag: 'test.tag',
+              imageUrl: 'https://example.com/image.png',
+              ticker: 'test.ticker',
+              sticky: true,
+              visibility: 'private',
+            },
+          },
+        },
+        expectedReq: {
+          android: {
+            notification: {
+              title: 'test.title',
+              body: 'test.body',
+              icon: 'test.icon',
+              color: '#112233',
+              sound: 'test.sound',
+              tag: 'test.tag',
+              image: 'https://example.com/image.png',
+              ticker: 'test.ticker',
+              sticky: true,
+              visibility: 'PRIVATE',
             },
           },
         },
@@ -2108,6 +3039,20 @@ describe('Messaging', () => {
               titleLocArgs: ['arg1', 'arg2'],
               bodyLocKey: 'body.loc.key',
               bodyLocArgs: ['arg1', 'arg2'],
+              channelId: 'test.channel',
+              eventTimestamp: new Date('2019-10-20T12:00:00-06:30'),
+              localOnly: true,
+              priority: 'high',
+              vibrateTimingsMillis: [100, 50, 250],
+              defaultVibrateTimings: false,
+              defaultSound: true,
+              lightSettings: {
+                color: '#AABBCCDD',
+                lightOnDurationMillis: 200,
+                lightOffDurationMillis: 300,
+              },
+              defaultLightSettings: false,
+              notificationCount: 1,
             },
           },
         },
@@ -2121,6 +3066,25 @@ describe('Messaging', () => {
               title_loc_args: ['arg1', 'arg2'],
               body_loc_key: 'body.loc.key',
               body_loc_args: ['arg1', 'arg2'],
+              channel_id: 'test.channel',
+              event_time: '2019-10-20T18:30:00.000Z',
+              local_only: true,
+              notification_priority: 'PRIORITY_HIGH',
+              vibrate_timings: ['0.100000000s', '0.050000000s', '0.250000000s'],
+              default_vibrate_timings: false,
+              default_sound: true,
+              light_settings: {
+                color: {
+                  red: 0.6666666666666666,
+                  green: 0.7333333333333333,
+                  blue: 0.8,
+                  alpha: 0.8666666666666667,
+                },
+                light_on_duration: '0.200000000s',
+                light_off_duration: '0.300000000s',
+              },
+              default_light_settings: false,
+              notification_count: 1,
             },
           },
         },
@@ -2163,11 +3127,32 @@ describe('Messaging', () => {
               color: '#112233',
               sound: 'test.sound',
               tag: 'test.tag',
+              imageUrl: 'https://example.com/image.png',
               clickAction: 'test.click.action',
               titleLocKey: 'title.loc.key',
               titleLocArgs: ['arg1', 'arg2'],
               bodyLocKey: 'body.loc.key',
               bodyLocArgs: ['arg1', 'arg2'],
+              channelId: 'test.channel',
+              ticker: 'test.ticker',
+              sticky: true,
+              visibility: 'private',
+              eventTimestamp: new Date('2019-10-20T12:00:00-06:30'),
+              localOnly: true,
+              priority: 'high',
+              vibrateTimingsMillis: [100, 50, 250],
+              defaultVibrateTimings: false,
+              defaultSound: true,
+              lightSettings: {
+                color: '#AABBCC',
+                lightOnDurationMillis: 200,
+                lightOffDurationMillis: 300,
+              },
+              defaultLightSettings: false,
+              notificationCount: 1,
+            },
+            fcmOptions: {
+              analyticsLabel: 'test.analytics',
             },
           },
         },
@@ -2188,11 +3173,37 @@ describe('Messaging', () => {
               color: '#112233',
               sound: 'test.sound',
               tag: 'test.tag',
+              image: 'https://example.com/image.png',
               click_action: 'test.click.action',
               title_loc_key: 'title.loc.key',
               title_loc_args: ['arg1', 'arg2'],
               body_loc_key: 'body.loc.key',
               body_loc_args: ['arg1', 'arg2'],
+              channel_id: 'test.channel',
+              ticker: 'test.ticker',
+              sticky: true,
+              visibility: 'PRIVATE',
+              event_time: '2019-10-20T18:30:00.000Z',
+              local_only: true,
+              notification_priority: 'PRIORITY_HIGH',
+              vibrate_timings: ['0.100000000s', '0.050000000s', '0.250000000s'],
+              default_vibrate_timings: false,
+              default_sound: true,
+              light_settings: {
+                color: {
+                  red: 0.6666666666666666,
+                  green: 0.7333333333333333,
+                  blue: 0.8,
+                  alpha: 1,
+                },
+                light_on_duration: '0.200000000s',
+                light_off_duration: '0.300000000s',
+              },
+              default_light_settings: false,
+              notification_count: 1,
+            },
+            fcmOptions: {
+              analyticsLabel: 'test.analytics',
             },
           },
         },
@@ -2253,6 +3264,9 @@ describe('Messaging', () => {
               image: 'test.image',
               requireInteraction: true,
             },
+            fcmOptions: {
+              link: 'https://example.com',
+            },
           },
         },
       },
@@ -2290,11 +3304,17 @@ describe('Messaging', () => {
             payload: {
               aps: {
                 alert: {
+                  title: 'title',
+                  subtitle: 'subtitle',
+                  body: 'body',
                   titleLocKey: 'title.loc.key',
                   titleLocArgs: ['arg1', 'arg2'],
+                  subtitleLocKey: 'subtitle.loc.key',
+                  subtitleLocArgs: ['arg1', 'arg2'],
                   locKey: 'body.loc.key',
                   locArgs: ['arg1', 'arg2'],
                   actionLocKey: 'action.loc.key',
+                  launchImage: 'image',
                 },
                 badge: 42,
                 sound: 'test.sound',
@@ -2304,7 +3324,11 @@ describe('Messaging', () => {
                 threadId: 'thread.id',
               },
               customKey1: 'custom.value',
-              customKey2: {nested: 'value'},
+              customKey2: { nested: 'value' },
+            },
+            fcmOptions: {
+              analyticsLabel: 'test.analytics',
+              imageUrl: 'https://example.com/image.png',
             },
           },
         },
@@ -2317,11 +3341,17 @@ describe('Messaging', () => {
             payload: {
               aps: {
                 'alert': {
+                  'title': 'title',
+                  'subtitle': 'subtitle',
+                  'body': 'body',
                   'title-loc-key': 'title.loc.key',
                   'title-loc-args': ['arg1', 'arg2'],
+                  'subtitle-loc-key': 'subtitle.loc.key',
+                  'subtitle-loc-args': ['arg1', 'arg2'],
                   'loc-key': 'body.loc.key',
                   'loc-args': ['arg1', 'arg2'],
                   'action-loc-key': 'action.loc.key',
+                  'launch-image': 'image',
                 },
                 'badge': 42,
                 'sound': 'test.sound',
@@ -2331,7 +3361,93 @@ describe('Messaging', () => {
                 'thread-id': 'thread.id',
               },
               customKey1: 'custom.value',
-              customKey2: {nested: 'value'},
+              customKey2: { nested: 'value' },
+            },
+            fcmOptions: {
+              analyticsLabel: 'test.analytics',
+              image: 'https://example.com/image.png',
+            },
+          },
+        },
+      },
+      {
+        label: 'APNS critical sound',
+        req: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  critical: true,
+                  name: 'test.sound',
+                  volume: 0.5,
+                },
+              },
+            },
+          },
+        },
+        expectedReq: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  critical: 1,
+                  name: 'test.sound',
+                  volume: 0.5,
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        label: 'APNS critical sound name only',
+        req: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  name: 'test.sound',
+                },
+              },
+            },
+          },
+        },
+        expectedReq: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  name: 'test.sound',
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        label: 'APNS critical sound explicitly false',
+        req: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  critical: false,
+                  name: 'test.sound',
+                  volume: 0.5,
+                },
+              },
+            },
+          },
+        },
+        expectedReq: {
+          apns: {
+            payload: {
+              aps: {
+                sound: {
+                  name: 'test.sound',
+                  volume: 0.5,
+                },
+              },
             },
           },
         },
@@ -2369,7 +3485,7 @@ describe('Messaging', () => {
         expectedReq: {
           apns: {
             payload: {
-              aps: {'content-available': 1},
+              aps: { 'content-available': 1 },
             },
           },
         },
@@ -2423,18 +3539,22 @@ describe('Messaging', () => {
         // Wait for the initial getToken() call to complete before stubbing https.request.
         return mockApp.INTERNAL.getToken()
           .then(() => {
-            httpsRequestStub = sinon.stub(https, 'request');
-            httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
+            const resp = utils.responseFrom({ message: 'test' });
+            httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(resp);
             const req = config.req;
             req.token = 'mock-token';
             return messaging.send(req);
           })
           .then(() => {
-            expect(requestWriteSpy).to.have.been.calledOnce;
-            const requestData = JSON.parse(requestWriteSpy.args[0][0]);
             const expectedReq = config.expectedReq || config.req;
             expectedReq.token = 'mock-token';
-            expect(requestData.message).to.deep.equal(expectedReq);
+            expect(httpsRequestStub).to.have.been.calledOnce.and.calledWith({
+              method: 'POST',
+              data: { message: expectedReq },
+              timeout: 10000,
+              url: 'https://fcm.googleapis.com/v1/projects/project_id/messages:send',
+              headers: expectedHeaders,
+            });
           });
       });
     });
@@ -2442,14 +3562,14 @@ describe('Messaging', () => {
     it('should not throw when the message is addressed to the prefixed topic name', () => {
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-          return messaging.send({topic: '/topics/mock-topic'});
+          const resp = utils.responseFrom({ message: 'test' });
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(resp);
+          return messaging.send({ topic: '/topics/mock-topic' });
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
-          const expectedReq = {topic: 'mock-topic'};
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
+          const expectedReq = { topic: 'mock-topic' };
           expect(requestData.message).to.deep.equal(expectedReq);
         });
     });
@@ -2458,9 +3578,7 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             mocks.messaging.payloadDataOnly,
@@ -2476,8 +3594,8 @@ describe('Messaging', () => {
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData).to.have.keys([
             'to', 'data', 'dry_run', 'time_to_live', 'collapse_key', 'mutable_content',
             'content_available', 'restricted_package_name', 'otherKey',
@@ -2489,9 +3607,7 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
           return messaging.sendToDevice(
             mocks.messaging.registrationToken,
             mocks.messaging.payloadDataOnly,
@@ -2502,8 +3618,8 @@ describe('Messaging', () => {
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          const requestData = httpsRequestStub.args[0][0].data;
           expect(requestData.dry_run).to.be.true;
         });
     });
@@ -2523,7 +3639,7 @@ describe('Messaging', () => {
     });
   });
 
-  function tokenSubscriptionTests(methodName) {
+  function tokenSubscriptionTests(methodName: string): void {
     const invalidRegistrationTokensArgumentError = 'Registration token(s) provided to ' +
       `${methodName}() must be a non-empty string or a non-empty array`;
 
@@ -2532,36 +3648,36 @@ describe('Messaging', () => {
       it('should throw given invalid type for registration token(s) argument: ' +
         JSON.stringify(invalidRegistrationToken), () => {
         expect(() => {
-          messaging[methodName](invalidRegistrationToken as string, mocks.messaging.topic);
+          messagingService[methodName](invalidRegistrationToken as string, mocks.messaging.topic);
         }).to.throw(invalidRegistrationTokensArgumentError);
       });
     });
 
     it('should throw given no registration token(s) argument', () => {
       expect(() => {
-        messaging[methodName](undefined as string, mocks.messaging.topic);
+        messagingService[methodName](undefined as any, mocks.messaging.topic);
       }).to.throw(invalidRegistrationTokensArgumentError);
     });
 
     it('should throw given empty string for registration token(s) argument', () => {
       expect(() => {
-        messaging[methodName]('', mocks.messaging.topic);
+        messagingService[methodName]('', mocks.messaging.topic);
       }).to.throw(invalidRegistrationTokensArgumentError);
     });
 
     it('should throw given empty array for registration token(s) argument', () => {
       expect(() => {
-        messaging[methodName]([], mocks.messaging.topic);
+        messagingService[methodName]([], mocks.messaging.topic);
       }).to.throw(invalidRegistrationTokensArgumentError);
     });
 
     it('should be rejected given empty string within array for registration token(s) argument', () => {
-      return messaging[methodName](['foo', 'bar', ''], mocks.messaging.topic)
+      return messagingService[methodName](['foo', 'bar', ''], mocks.messaging.topic)
         .should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
     });
 
     it('should be rejected given non-string value within array for registration token(s) argument', () => {
-      return messaging[methodName](['foo', true as any, 'bar'], mocks.messaging.topic)
+      return messagingService[methodName](['foo', true as any, 'bar'], mocks.messaging.topic)
         .should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
     });
 
@@ -2571,12 +3687,12 @@ describe('Messaging', () => {
       // Create an array of exactly 1,000 registration tokens
       const registrationTokens = (Array(1000) as any).fill(mocks.messaging.registrationToken);
 
-      return messaging[methodName](registrationTokens, mocks.messaging.topic)
+      return messagingService[methodName](registrationTokens, mocks.messaging.topic)
         .then(() => {
           // Push the array of registration tokens over 1,000 items
           registrationTokens.push(mocks.messaging.registrationToken);
 
-          return messaging[methodName](registrationTokens, mocks.messaging.topic)
+          return messagingService[methodName](registrationTokens, mocks.messaging.topic)
             .should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
         });
     });
@@ -2587,27 +3703,27 @@ describe('Messaging', () => {
     invalidTopics.forEach((invalidTopic) => {
       it(`should throw given invalid type for topic argument: ${ JSON.stringify(invalidTopic) }`, () => {
         expect(() => {
-          messaging[methodName](mocks.messaging.registrationToken, invalidTopic as string);
+          messagingService[methodName](mocks.messaging.registrationToken, invalidTopic as string);
         }).to.throw(invalidTopicArgumentError);
       });
     });
 
     it('should throw given no topic argument', () => {
       expect(() => {
-        messaging[methodName](mocks.messaging.registrationToken, undefined as string);
+        messagingService[methodName](mocks.messaging.registrationToken, undefined as any);
       }).to.throw(invalidTopicArgumentError);
     });
 
     it('should throw given empty string for topic argument', () => {
       expect(() => {
-        messaging[methodName](mocks.messaging.registrationToken, '');
+        messagingService[methodName](mocks.messaging.registrationToken, '');
       }).to.throw(invalidTopicArgumentError);
     });
 
     const topicsWithInvalidCharacters = ['f*o*o', '/topics/f+o+o', 'foo/topics/foo', '$foo', '/topics/foo&'];
     topicsWithInvalidCharacters.forEach((invalidTopic) => {
       it(`should be rejected given topic argument which has invalid characters: ${ invalidTopic }`, () => {
-        return messaging[methodName](mocks.messaging.registrationToken, invalidTopic)
+        return messagingService[methodName](mocks.messaging.registrationToken, invalidTopic)
           .should.eventually.be.rejected.and.have.property('code', 'messaging/invalid-argument');
       });
     });
@@ -2615,7 +3731,7 @@ describe('Messaging', () => {
     it('should be rejected given a 200 JSON server response with a known error', () => {
       mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, 200, 'json'));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', expectedErrorCodes.json);
@@ -2624,7 +3740,7 @@ describe('Messaging', () => {
     it('should be rejected given a 200 JSON server response with an unknown error', () => {
       mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, 200, 'json', { error: 'Unknown' }));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', expectedErrorCodes.unknownError);
@@ -2633,7 +3749,7 @@ describe('Messaging', () => {
     it('should be rejected given a non-2xx JSON server response', () => {
       mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, 400, 'json'));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', expectedErrorCodes.json);
@@ -2642,7 +3758,7 @@ describe('Messaging', () => {
     it('should be rejected given a non-2xx JSON server response with an unknown error', () => {
       mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, 400, 'json', { error: 'Unknown' }));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', expectedErrorCodes.unknownError);
@@ -2651,7 +3767,7 @@ describe('Messaging', () => {
     it('should be rejected given a non-2xx JSON server response without an error', () => {
       mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, 400, 'json', { foo: 'bar' }));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', expectedErrorCodes.unknownError);
@@ -2660,8 +3776,9 @@ describe('Messaging', () => {
     _.forEach(STATUS_CODE_TO_ERROR_MAP, (expectedError, statusCode) => {
       it(`should be rejected given a ${ statusCode } text server response`, () => {
         mockedRequests.push(mockTopicSubscriptionRequestWithError(methodName, parseInt(statusCode, 10), 'text'));
+        disableRetries(messaging);
 
-        return messaging[methodName](
+        return messagingService[methodName](
           mocks.messaging.registrationToken,
           mocks.messaging.topic,
         ).should.eventually.be.rejected.and.have.property('code', expectedError);
@@ -2669,21 +3786,21 @@ describe('Messaging', () => {
     });
 
     it('should be rejected given an app which returns null access tokens', () => {
-      return nullAccessTokenMessaging[methodName](
+      return nullAccessTokenMessagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', 'app/invalid-credential');
     });
 
     it('should be rejected given an app which returns invalid access tokens', () => {
-      return nullAccessTokenMessaging[methodName](
+      return nullAccessTokenMessagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', 'app/invalid-credential');
     });
 
     it('should be rejected given an app which fails to generate access tokens', () => {
-      return nullAccessTokenMessaging[methodName](
+      return nullAccessTokenMessagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.be.rejected.and.have.property('code', 'app/invalid-credential');
@@ -2693,7 +3810,7 @@ describe('Messaging', () => {
        'with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       );
@@ -2703,7 +3820,7 @@ describe('Messaging', () => {
        'with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topicWithPrefix,
       );
@@ -2713,7 +3830,7 @@ describe('Messaging', () => {
        'prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 3));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         [
           mocks.messaging.registrationToken + '0',
           mocks.messaging.registrationToken + '1',
@@ -2727,7 +3844,7 @@ describe('Messaging', () => {
        'prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 3));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         [
           mocks.messaging.registrationToken + '0',
           mocks.messaging.registrationToken + '1',
@@ -2741,7 +3858,7 @@ describe('Messaging', () => {
        '(topic name not prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topic,
       ).should.eventually.deep.equal({
@@ -2755,7 +3872,7 @@ describe('Messaging', () => {
        '(topic name prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         mocks.messaging.registrationToken,
         mocks.messaging.topicWithPrefix,
       ).should.eventually.deep.equal({
@@ -2769,7 +3886,7 @@ describe('Messaging', () => {
        'and topic (topic name not prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1, /* failureCount */ 2));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         [
           mocks.messaging.registrationToken + '0',
           mocks.messaging.registrationToken + '1',
@@ -2794,7 +3911,7 @@ describe('Messaging', () => {
        'and topic (topic name prefixed with "/topics/")', () => {
       mockedRequests.push(mockTopicSubscriptionRequest(methodName, /* successCount */ 1, /* failureCount */ 2));
 
-      return messaging[methodName](
+      return messagingService[methodName](
         [
           mocks.messaging.registrationToken + '0',
           mocks.messaging.registrationToken + '1',
@@ -2820,21 +3937,19 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
-          return messaging[methodName](
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
+          return messagingService[methodName](
             mocks.messaging.registrationToken,
             mocks.messaging.topic,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
-          expect(requestData).to.deep.equal({
+          const expectedReq = {
             to: mocks.messaging.topicWithPrefix,
             registration_tokens: [mocks.messaging.registrationToken],
-          });
+          };
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          expect(httpsRequestStub.args[0][0].data).to.deep.equal(expectedReq);
         });
     });
 
@@ -2843,21 +3958,19 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
-          return messaging[methodName](
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
+          return messagingService[methodName](
             mocks.messaging.registrationToken,
             mocks.messaging.topicWithPrefix,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
-          expect(requestData).to.deep.equal({
+          const expectedReq = {
             to: mocks.messaging.topicWithPrefix,
             registration_tokens: [mocks.messaging.registrationToken],
-          });
+          };
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          expect(httpsRequestStub.args[0][0].data).to.deep.equal(expectedReq);
         });
     });
 
@@ -2872,21 +3985,19 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
-          return messaging[methodName](
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
+          return messagingService[methodName](
             registrationTokens,
             mocks.messaging.topic,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
-          expect(requestData).to.deep.equal({
+          const expectedReq = {
             to: mocks.messaging.topicWithPrefix,
             registration_tokens: registrationTokens,
-          });
+          };
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          expect(httpsRequestStub.args[0][0].data).to.deep.equal(expectedReq);
         });
     });
 
@@ -2901,21 +4012,19 @@ describe('Messaging', () => {
       // Wait for the initial getToken() call to complete before stubbing https.request.
       return mockApp.INTERNAL.getToken()
         .then(() => {
-          httpsRequestStub = sinon.stub(https, 'request');
-          httpsRequestStub.callsArgWith(1, mockResponse).returns(mockRequestStream);
-
-          return messaging[methodName](
+          httpsRequestStub = sinon.stub(HttpClient.prototype, 'send').resolves(emptyResponse);
+          return messagingService[methodName](
             registrationTokens,
             mocks.messaging.topicWithPrefix,
           );
         })
         .then(() => {
-          expect(requestWriteSpy).to.have.been.calledOnce;
-          const requestData = JSON.parse(requestWriteSpy.args[0][0]);
-          expect(requestData).to.deep.equal({
+          const expectedReq = {
             to: mocks.messaging.topicWithPrefix,
             registration_tokens: registrationTokens,
-          });
+          };
+          expect(httpsRequestStub).to.have.been.calledOnce;
+          expect(httpsRequestStub.args[0][0].data).to.deep.equal(expectedReq);
         });
     });
   }
@@ -2926,11 +4035,5 @@ describe('Messaging', () => {
 
   describe('unsubscribeFromTopic()', () => {
     tokenSubscriptionTests('unsubscribeFromTopic');
-  });
-
-  describe('INTERNAL.delete()', () => {
-    it('should delete Messaging instance', () => {
-      messaging.INTERNAL.delete().should.eventually.be.fulfilled;
-    });
   });
 });

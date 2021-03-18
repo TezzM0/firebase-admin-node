@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,7 @@ import url = require('url');
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is byte buffer or not.
  */
-export function isBuffer(value: any): boolean {
+export function isBuffer(value: any): value is Buffer {
   return value instanceof Buffer;
 }
 
@@ -32,7 +33,7 @@ export function isBuffer(value: any): boolean {
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is an array or not.
  */
-export function isArray(value: any): boolean {
+export function isArray<T>(value: any): value is T[] {
   return Array.isArray(value);
 }
 
@@ -42,7 +43,7 @@ export function isArray(value: any): boolean {
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is a non-empty array or not.
  */
-export function isNonEmptyArray(value: any): boolean {
+export function isNonEmptyArray<T>(value: any): value is T[] {
   return isArray(value) && value.length !== 0;
 }
 
@@ -75,8 +76,22 @@ export function isNumber(value: any): boolean {
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is a string or not.
  */
-export function isString(value: any): boolean {
+export function isString(value: any): value is string {
   return typeof value === 'string';
+}
+
+
+/**
+ * Validates that a value is a base64 string.
+ *
+ * @param {any} value The value to validate.
+ * @return {boolean} Whether the value is a base64 string or not.
+ */
+export function isBase64String(value: any): boolean {
+  if (!isString(value)) {
+    return false;
+  }
+  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
 }
 
 
@@ -86,7 +101,7 @@ export function isString(value: any): boolean {
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is a non-empty string or not.
  */
-export function isNonEmptyString(value: any): boolean {
+export function isNonEmptyString(value: any): value is string {
   return isString(value) && value !== '';
 }
 
@@ -108,7 +123,7 @@ export function isObject(value: any): boolean {
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is a non-null object or not.
  */
-export function isNonNullObject(value: any): boolean {
+export function isNonNullObject<T>(value: T | null | undefined): value is T {
   return isObject(value) && value !== null;
 }
 
@@ -171,6 +186,36 @@ export function isPhoneNumber(phoneNumber: any): boolean {
   return re1.test(phoneNumber) && re2.test(phoneNumber);
 }
 
+/**
+ * Validates that a string is a valid ISO date string.
+ *
+ * @param dateString The string to validate.
+ * @return Whether the string is a valid ISO date string.
+ */
+export function isISODateString(dateString: any): boolean {
+  try {
+    return isNonEmptyString(dateString) &&
+        (new Date(dateString).toISOString() === dateString);
+  } catch (e) {
+    return false;
+  }
+}
+
+
+/**
+ * Validates that a string is a valid UTC date string.
+ *
+ * @param dateString The string to validate.
+ * @return Whether the string is a valid UTC date string.
+ */
+export function isUTCDateString(dateString: any): boolean {
+  try {
+    return isNonEmptyString(dateString) &&
+        (new Date(dateString).toUTCString() === dateString);
+  } catch (e) {
+    return false;
+  }
+}
 
 
 /**
@@ -184,7 +229,7 @@ export function isURL(urlStr: any): boolean {
     return false;
   }
   // Lookup illegal characters.
-  const re = /[^a-z0-9\:\/\?\#\[\]\@\!\$\&\'\(\)\*\+\,\;\=\.\-\_\~\%]/i;
+  const re = /[^a-z0-9:/?#[\]@!$&'()*+,;=.\-_~%]/i;
   if (re.test(urlStr)) {
     return false;
   }
@@ -199,12 +244,12 @@ export function isURL(urlStr: any): boolean {
     }
     // Validate hostname: Can contain letters, numbers, underscore and dashes separated by a dot.
     // Each zone must not start with a hyphen or underscore.
-    if (!/^[a-zA-Z0-9]+[\w\-]*([\.]?[a-zA-Z0-9]+[\w\-]*)*$/.test(hostname)) {
+    if (!hostname || !/^[a-zA-Z0-9]+[\w-]*([.]?[a-zA-Z0-9]+[\w-]*)*$/.test(hostname)) {
       return false;
     }
     // Allow for pathnames: (/chars+)*/?
     // Where chars can be a combination of: a-z A-Z 0-9 - _ . ~ ! $ & ' ( ) * + , ; = : @ %
-    const pathnameRe = /^(\/[\w\-\.\~\!\$\'\(\)\*\+\,\;\=\:\@\%]+)*\/?$/;
+    const pathnameRe = /^(\/[\w\-.~!$'()*+,;=:@%]+)*\/?$/;
     // Validate pathname.
     if (pathname &&
         pathname !== '/' &&

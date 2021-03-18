@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,38 +15,34 @@
  * limitations under the License.
  */
 
-import {ApplicationDefaultCredential, Credential, GoogleOAuthAccessToken} from './auth/credential';
+import { AppOptions, app } from './firebase-namespace-api';
+import { credential, GoogleOAuthAccessToken } from './credential/index';
+import { getApplicationDefault } from './credential/credential-internal';
 import * as validator from './utils/validator';
-import {deepCopy, deepExtend} from './utils/deep-copy';
-import {FirebaseServiceInterface} from './firebase-service';
-import {FirebaseNamespaceInternals} from './firebase-namespace';
-import {AppErrorCodes, FirebaseAppError} from './utils/error';
+import { deepCopy } from './utils/deep-copy';
+import { FirebaseNamespaceInternals } from './firebase-namespace';
+import { AppErrorCodes, FirebaseAppError } from './utils/error';
 
-import {Auth} from './auth/auth';
-import {Messaging} from './messaging/messaging';
-import {Storage} from './storage/storage';
-import {Database} from '@firebase/database';
-import {DatabaseService} from './database/database';
-import {Firestore} from '@google-cloud/firestore';
-import {FirestoreService} from './firestore/firestore';
-import {InstanceId} from './instance-id/instance-id';
+import { Auth } from './auth/auth';
+import { MachineLearning } from './machine-learning/machine-learning';
+import { Messaging } from './messaging/messaging';
+import { Storage } from './storage/storage';
+import { database } from './database/index';
+import { DatabaseService } from './database/database-internal';
+import { Firestore } from '@google-cloud/firestore';
+import { FirestoreService } from './firestore/firestore-internal';
+import { InstanceId } from './instance-id/instance-id';
+import { ProjectManagement } from './project-management/project-management';
+import { SecurityRules } from './security-rules/security-rules';
+import { RemoteConfig } from './remote-config/remote-config';
+
+import Credential = credential.Credential;
+import Database = database.Database;
 
 /**
  * Type representing a callback which is called every time an app lifecycle event occurs.
  */
-export type AppHook = (event: string, app: FirebaseApp) => void;
-
-/**
- * Type representing the options object passed into initializeApp().
- */
-export interface FirebaseAppOptions {
-  credential?: Credential;
-  databaseAuthVariableOverride?: object;
-  databaseURL?: string;
-  serviceAccountId?: string;
-  storageBucket?: string;
-  projectId?: string;
-}
+export type AppHook = (event: string, app: app.App) => void;
 
 /**
  * Type representing a Firebase OAuth access token (derived from a Google OAuth2 access token) which
@@ -62,7 +59,7 @@ export interface FirebaseAccessToken {
 export class FirebaseAppInternals {
   private isDeleted_ = false;
   private cachedToken_: FirebaseAccessToken;
-  private cachedTokenPromise_: Promise<FirebaseAccessToken>;
+  private cachedTokenPromise_: Promise<FirebaseAccessToken> | null;
   private tokenListeners_: Array<(token: string) => void>;
   private tokenRefreshTimeout_: NodeJS.Timer;
 
@@ -184,7 +181,7 @@ export class FirebaseAppInternals {
    *
    * @param {function(string)} listener The listener that will be called with each new token.
    */
-  public addAuthTokenListener(listener: (token: string) => void) {
+  public addAuthTokenListener(listener: (token: string) => void): void {
     this.tokenListeners_.push(listener);
     if (this.cachedToken_) {
       listener(this.cachedToken_.accessToken);
@@ -196,7 +193,7 @@ export class FirebaseAppInternals {
    *
    * @param {function(string)} listener The listener to remove.
    */
-  public removeAuthTokenListener(listener: (token: string) => void) {
+  public removeAuthTokenListener(listener: (token: string) => void): void {
     this.tokenListeners_ = this.tokenListeners_.filter((other) => other !== listener);
   }
 
@@ -220,7 +217,7 @@ export class FirebaseAppInternals {
   private setTokenRefreshTimeout(delayInMilliseconds: number, numRetries: number): void {
     this.tokenRefreshTimeout_ = setTimeout(() => {
       this.getToken(/* forceRefresh */ true)
-        .catch((error) => {
+        .catch(() => {
           // Ignore the error since this might just be an intermittent failure. If we really cannot
           // refresh the token, an error will be logged once the existing token expires and we try
           // to fetch a fresh one.
@@ -232,58 +229,51 @@ export class FirebaseAppInternals {
   }
 }
 
-
-
 /**
  * Global context object for a collection of services using a shared authentication state.
  */
-export class FirebaseApp {
+export class FirebaseApp implements app.App {
   public INTERNAL: FirebaseAppInternals;
 
   private name_: string;
-  private options_: FirebaseAppOptions;
-  private services_: {[name: string]: FirebaseServiceInterface} = {};
+  private options_: AppOptions;
+  private services_: {[name: string]: unknown} = {};
   private isDeleted_ = false;
 
-  constructor(options: FirebaseAppOptions, name: string, private firebaseInternals_: FirebaseNamespaceInternals) {
+  constructor(options: AppOptions, name: string, private firebaseInternals_: FirebaseNamespaceInternals) {
     this.name_ = name;
-    this.options_ = deepCopy(options) as FirebaseAppOptions;
+    this.options_ = deepCopy(options);
 
     if (!validator.isNonNullObject(this.options_)) {
       throw new FirebaseAppError(
         AppErrorCodes.INVALID_APP_OPTIONS,
-        `Invalid Firebase app options passed as the first argument to initializeApp() for the ` +
+        'Invalid Firebase app options passed as the first argument to initializeApp() for the ' +
         `app named "${this.name_}". Options must be a non-null object.`,
       );
     }
 
     const hasCredential = ('credential' in this.options_);
     if (!hasCredential) {
-      this.options_.credential = new ApplicationDefaultCredential();
+      this.options_.credential = getApplicationDefault(this.options_.httpAgent);
     }
 
     const credential = this.options_.credential;
     if (typeof credential !== 'object' || credential === null || typeof credential.getAccessToken !== 'function') {
       throw new FirebaseAppError(
         AppErrorCodes.INVALID_APP_OPTIONS,
-        `Invalid Firebase app options passed as the first argument to initializeApp() for the ` +
+        'Invalid Firebase app options passed as the first argument to initializeApp() for the ' +
         `app named "${this.name_}". The "credential" property must be an object which implements ` +
-        `the Credential interface.`,
+        'the Credential interface.',
       );
     }
 
-    Object.keys(firebaseInternals_.serviceFactories).forEach((serviceName) => {
-      // Defer calling createService() until the service is accessed
-      this[serviceName] = this.getService_.bind(this, serviceName);
-    });
-
-    this.INTERNAL = new FirebaseAppInternals(this.options_.credential);
+    this.INTERNAL = new FirebaseAppInternals(credential);
   }
 
   /**
    * Returns the Auth service instance associated with this app.
    *
-   * @return {Auth} The Auth service instance of this app.
+   * @return The Auth service instance of this app.
    */
   public auth(): Auth {
     return this.ensureService_('auth', () => {
@@ -295,11 +285,11 @@ export class FirebaseApp {
   /**
    * Returns the Database service for the specified URL, and the current app.
    *
-   * @return {Database} The Database service instance of this app.
+   * @return The Database service instance of this app.
    */
   public database(url?: string): Database {
     const service: DatabaseService = this.ensureService_('database', () => {
-      const dbService: typeof DatabaseService = require('./database/database').DatabaseService;
+      const dbService: typeof DatabaseService = require('./database/database-internal').DatabaseService;
       return new dbService(this);
     });
     return service.getDatabase(url);
@@ -308,7 +298,7 @@ export class FirebaseApp {
   /**
    * Returns the Messaging service instance associated with this app.
    *
-   * @return {Messaging} The Messaging service instance of this app.
+   * @return The Messaging service instance of this app.
    */
   public messaging(): Messaging {
     return this.ensureService_('messaging', () => {
@@ -320,7 +310,7 @@ export class FirebaseApp {
   /**
    * Returns the Storage service instance associated with this app.
    *
-   * @return {Storage} The Storage service instance of this app.
+   * @return The Storage service instance of this app.
    */
   public storage(): Storage {
     return this.ensureService_('storage', () => {
@@ -331,7 +321,7 @@ export class FirebaseApp {
 
   public firestore(): Firestore {
     const service: FirestoreService = this.ensureService_('firestore', () => {
-      const firestoreService: typeof FirestoreService = require('./firestore/firestore').FirestoreService;
+      const firestoreService: typeof FirestoreService = require('./firestore/firestore-internal').FirestoreService;
       return new firestoreService(this);
     });
     return service.client;
@@ -340,7 +330,7 @@ export class FirebaseApp {
   /**
    * Returns the InstanceId service instance associated with this app.
    *
-   * @return {InstanceId} The InstanceId service instance of this app.
+   * @return The InstanceId service instance of this app.
    */
   public instanceId(): InstanceId {
     return this.ensureService_('iid', () => {
@@ -350,9 +340,60 @@ export class FirebaseApp {
   }
 
   /**
+   * Returns the MachineLearning service instance associated with this app.
+   *
+   * @return The Machine Learning service instance of this app
+   */
+  public machineLearning(): MachineLearning {
+    return this.ensureService_('machine-learning', () => {
+      const machineLearningService: typeof MachineLearning =
+          require('./machine-learning/machine-learning').MachineLearning;
+      return new machineLearningService(this);
+    });
+  }
+
+  /**
+   * Returns the ProjectManagement service instance associated with this app.
+   *
+   * @return The ProjectManagement service instance of this app.
+   */
+  public projectManagement(): ProjectManagement {
+    return this.ensureService_('project-management', () => {
+      const projectManagementService: typeof ProjectManagement =
+          require('./project-management/project-management').ProjectManagement;
+      return new projectManagementService(this);
+    });
+  }
+
+  /**
+   * Returns the SecurityRules service instance associated with this app.
+   *
+   * @return The SecurityRules service instance of this app.
+   */
+  public securityRules(): SecurityRules {
+    return this.ensureService_('security-rules', () => {
+      const securityRulesService: typeof SecurityRules =
+          require('./security-rules/security-rules').SecurityRules;
+      return new securityRulesService(this);
+    });
+  }
+
+  /**
+   * Returns the RemoteConfig service instance associated with this app.
+   *
+   * @return The RemoteConfig service instance of this app.
+   */
+  public remoteConfig(): RemoteConfig {
+    return this.ensureService_('remoteConfig', () => {
+      const remoteConfigService: typeof RemoteConfig = require('./remote-config/remote-config').RemoteConfig;
+      return new remoteConfigService(this);
+    });
+  }
+
+  /**
    * Returns the name of the FirebaseApp instance.
    *
-   * @returns {string} The name of the FirebaseApp instance.
+   * @return The name of the FirebaseApp instance.
    */
   get name(): string {
     this.checkDestroyed_();
@@ -362,17 +403,17 @@ export class FirebaseApp {
   /**
    * Returns the options for the FirebaseApp instance.
    *
-   * @returns {FirebaseAppOptions} The options for the FirebaseApp instance.
+   * @return The options for the FirebaseApp instance.
    */
-  get options(): FirebaseAppOptions {
+  get options(): AppOptions {
     this.checkDestroyed_();
-    return deepCopy(this.options_) as FirebaseAppOptions;
+    return deepCopy(this.options_);
   }
 
   /**
    * Deletes the FirebaseApp instance.
    *
-   * @returns {Promise<void>} An empty Promise fulfilled once the FirebaseApp instance is deleted.
+   * @return An empty Promise fulfilled once the FirebaseApp instance is deleted.
    */
   public delete(): Promise<void> {
     this.checkDestroyed_();
@@ -381,51 +422,24 @@ export class FirebaseApp {
     this.INTERNAL.delete();
 
     return Promise.all(Object.keys(this.services_).map((serviceName) => {
-      return this.services_[serviceName].INTERNAL.delete();
+      const service = this.services_[serviceName];
+      if (isStateful(service)) {
+        return service.delete();
+      }
+      return Promise.resolve();
     })).then(() => {
       this.services_ = {};
       this.isDeleted_ = true;
     });
   }
 
-  private ensureService_<T extends FirebaseServiceInterface>(serviceName: string, initializer: () => T): T {
+  private ensureService_<T>(serviceName: string, initializer: () => T): T {
     this.checkDestroyed_();
-
-    let service: T;
-    if (serviceName in this.services_) {
-      service = this.services_[serviceName] as T;
-    } else {
-      service = initializer();
-      this.services_[serviceName] = service;
-    }
-    return service;
-  }
-
-  /**
-   * Returns the service instance associated with this FirebaseApp instance (creating it on demand
-   * if needed). This is used for looking up monkeypatched service instances.
-   *
-   * @param {string} serviceName The name of the service instance to return.
-   * @return {FirebaseServiceInterface} The service instance with the provided name.
-   */
-  private getService_(serviceName: string): FirebaseServiceInterface {
-    this.checkDestroyed_();
-
     if (!(serviceName in this.services_)) {
-      this.services_[serviceName] = this.firebaseInternals_.serviceFactories[serviceName](
-        this,
-        this.extendApp_.bind(this),
-      );
+      this.services_[serviceName] = initializer();
     }
 
-    return this.services_[serviceName];
-  }
-
-  /**
-   * Callback function used to extend an App instance at the time of service instance creation.
-   */
-  private extendApp_(props: {[prop: string]: any}): void {
-    deepExtend(this, props);
+    return this.services_[serviceName] as T;
   }
 
   /**
@@ -439,4 +453,12 @@ export class FirebaseApp {
       );
     }
   }
+}
+
+interface StatefulFirebaseService {
+  delete(): Promise<void>;
+}
+
+function isStateful(service: any): service is StatefulFirebaseService {
+  return typeof service.delete === 'function';
 }

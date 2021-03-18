@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +15,33 @@
  * limitations under the License.
  */
 
-import {FirebaseApp} from '../firebase-app';
-import {renameProperties} from '../utils/index';
-import {deepCopy, deepExtend} from '../utils/deep-copy';
-import {FirebaseMessagingRequestHandler} from './messaging-api-request';
-import {FirebaseServiceInterface, FirebaseServiceInternalsInterface} from '../firebase-service';
-import {
-  ErrorInfo, FirebaseError, FirebaseArrayIndexError, MessagingClientErrorCode, FirebaseMessagingError,
-} from '../utils/error';
-
+import { FirebaseApp } from '../firebase-app';
+import { deepCopy, deepExtend } from '../utils/deep-copy';
+import { SubRequest } from './batch-request-internal';
+import { validateMessage, BLACKLISTED_DATA_PAYLOAD_KEYS, BLACKLISTED_OPTIONS_KEYS } from './messaging-internal';
+import { messaging } from './index';
+import { FirebaseMessagingRequestHandler } from './messaging-api-request-internal';
+import { ErrorInfo, MessagingClientErrorCode, FirebaseMessagingError } from '../utils/error';
 import * as utils from '../utils';
 import * as validator from '../utils/validator';
+
+import MessagingInterface = messaging.Messaging;
+import Message = messaging.Message;
+import BatchResponse = messaging.BatchResponse;
+import MulticastMessage = messaging.MulticastMessage;
+import MessagingTopicManagementResponse = messaging.MessagingTopicManagementResponse;
+
+// Legacy API types
+import MessagingDevicesResponse = messaging.MessagingDevicesResponse;
+import MessagingDeviceGroupResponse = messaging.MessagingDeviceGroupResponse;
+import MessagingPayload = messaging.MessagingPayload;
+import MessagingOptions = messaging.MessagingOptions;
+import MessagingTopicResponse = messaging.MessagingTopicResponse;
+import MessagingConditionResponse = messaging.MessagingConditionResponse;
+import DataMessagePayload = messaging.DataMessagePayload;
+import NotificationMessagePayload = messaging.NotificationMessagePayload;
+
+/* eslint-disable @typescript-eslint/camelcase */
 
 // FCM endpoints
 const FCM_SEND_HOST = 'fcm.googleapis.com';
@@ -33,6 +50,8 @@ const FCM_TOPIC_MANAGEMENT_HOST = 'iid.googleapis.com';
 const FCM_TOPIC_MANAGEMENT_ADD_PATH = '/iid/v1:batchAdd';
 const FCM_TOPIC_MANAGEMENT_REMOVE_PATH = '/iid/v1:batchRemove';
 
+// Maximum messages that can be included in a batch request.
+const FCM_MAX_BATCH_SIZE = 500;
 
 // Key renames for the messaging notification payload object.
 const CAMELCASED_NOTIFICATION_PAYLOAD_KEYS_MAP = {
@@ -84,494 +103,6 @@ const MESSAGING_CONDITION_RESPONSE_KEYS_MAP = {
   message_id: 'messageId',
 };
 
-// Keys which are not allowed in the messaging data payload object.
-export const BLACKLISTED_DATA_PAYLOAD_KEYS = ['from'];
-
-// Keys which are not allowed in the messaging options object.
-export const BLACKLISTED_OPTIONS_KEYS = [
-  'condition', 'data', 'notification', 'registrationIds', 'registration_ids', 'to',
-];
-
-interface BaseMessage {
-  data?: {[key: string]: string};
-  notification?: Notification;
-  android?: AndroidConfig;
-  webpush?: WebpushConfig;
-  apns?: ApnsConfig;
-}
-
-interface TokenMessage extends BaseMessage {
-  token: string;
-}
-
-interface TopicMessage extends BaseMessage {
-  topic: string;
-}
-
-interface ConditionMessage extends BaseMessage {
-  condition: string;
-}
-
-/**
- * Payload for the admin.messaging.send() operation. The payload contains all the fields
- * in the BaseMessage type, and exactly one of token, topic or condition.
- */
-export type Message = TokenMessage | TopicMessage | ConditionMessage;
-
-export interface Notification {
-  title?: string;
-  body?: string;
-}
-
-export interface WebpushConfig {
-  headers?: {[key: string]: string};
-  data?: {[key: string]: string};
-  notification?: WebpushNotification;
-}
-
-export interface WebpushNotification {
-  title?: string;
-  actions?: Array<{
-    action: string;
-    icon?: string;
-    title: string;
-  }>;
-  badge?: string;
-  body?: string;
-  data?: any;
-  dir?: 'auto' | 'ltr' | 'rtl';
-  icon?: string;
-  image?: string;
-  lang?: string;
-  renotify?: boolean;
-  requireInteraction?: boolean;
-  silent?: boolean;
-  tag?: string;
-  timestamp?: number;
-  vibrate?: number | number[];
-  [key: string]: any;
-}
-
-export interface ApnsConfig {
-  headers?: {[key: string]: string};
-  payload?: ApnsPayload;
-}
-
-export interface ApnsPayload {
-  aps: Aps;
-  [customData: string]: object;
-}
-
-export interface Aps {
-  alert?: string | ApsAlert;
-  badge?: number;
-  sound?: string;
-  contentAvailable?: boolean;
-  category?: string;
-  threadId?: string;
-  mutableContent?: boolean;
-  [customData: string]: any;
-}
-
-export interface ApsAlert {
-  title?: string;
-  body?: string;
-  locKey?: string;
-  locArgs?: string[];
-  titleLocKey?: string;
-  titleLocArgs?: string[];
-  actionLocKey?: string;
-  launchImage?: string;
-}
-
-export interface AndroidConfig {
-  collapseKey?: string;
-  priority?: ('high' | 'normal');
-  ttl?: number;
-  restrictedPackageName?: string;
-  data?: {[key: string]: string};
-  notification?: AndroidNotification;
-}
-
-export interface AndroidNotification {
-  title?: string;
-  body?: string;
-  icon?: string;
-  color?: string;
-  sound?: string;
-  tag?: string;
-  clickAction?: string;
-  bodyLocKey?: string;
-  bodyLocArgs?: string[];
-  titleLocKey?: string;
-  titleLocArgs?: string[];
-}
-
-/**
- * Checks if the given object only contains strings as child values.
- *
- * @param {object} map An object to be validated.
- * @param {string} label A label to be included in the errors thrown.
- */
-function validateStringMap(map: object, label: string) {
-  if (typeof map === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(map)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, `${label} must be a non-null object`);
-  }
-  Object.keys(map).forEach((key) => {
-    if (!validator.isString(map[key])) {
-      throw new FirebaseMessagingError(
-        MessagingClientErrorCode.INVALID_PAYLOAD, `${label} must only contain string values`);
-    }
-  });
-}
-
-/**
- * Checks if the given WebpushConfig object is valid. The object must have valid headers and data.
- *
- * @param {WebpushConfig} config An object to be validated.
- */
-function validateWebpushConfig(config: WebpushConfig) {
-  if (typeof config === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(config)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'webpush must be a non-null object');
-  }
-  validateStringMap(config.headers, 'webpush.headers');
-  validateStringMap(config.data, 'webpush.data');
-}
-
-/**
- * Checks if the given ApnsConfig object is valid. The object must have valid headers and a
- * payload.
- *
- * @param {ApnsConfig} config An object to be validated.
- */
-function validateApnsConfig(config: ApnsConfig) {
-  if (typeof config === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(config)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'apns must be a non-null object');
-  }
-  validateStringMap(config.headers, 'apns.headers');
-  validateApnsPayload(config.payload);
-}
-
-/**
- * Checks if the given ApnsPayload object is valid. The object must have a valid aps value.
- *
- * @param {ApnsPayload} payload An object to be validated.
- */
-function validateApnsPayload(payload: ApnsPayload) {
-  if (typeof payload === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(payload)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'apns.payload must be a non-null object');
-  }
-  validateAps(payload.aps);
-}
-
-/**
- * Checks if the given Aps object is valid. The object must have a valid alert. If the validation
- * is successful, transforms the input object by renaming the keys to valid APNS payload keys.
- *
- * @param {Aps} aps An object to be validated.
- */
-function validateAps(aps: Aps) {
-  if (typeof aps === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(aps)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'apns.payload.aps must be a non-null object');
-  }
-  validateApsAlert(aps.alert);
-
-  const propertyMappings = {
-    contentAvailable: 'content-available',
-    mutableContent: 'mutable-content',
-    threadId: 'thread-id',
-  };
-  Object.keys(propertyMappings).forEach((key) => {
-    if (key in aps && propertyMappings[key] in aps) {
-      throw new FirebaseMessagingError(
-        MessagingClientErrorCode.INVALID_PAYLOAD, `Multiple specifications for ${key} in Aps`);
-    }
-  });
-  renameProperties(aps, propertyMappings);
-
-  const contentAvailable = aps['content-available'];
-  if (typeof contentAvailable !== 'undefined' && contentAvailable !== 1) {
-    if (contentAvailable === true) {
-      aps['content-available'] = 1;
-    } else {
-      delete aps['content-available'];
-    }
-  }
-
-  const mutableContent = aps['mutable-content'];
-  if (typeof mutableContent !== 'undefined' && mutableContent !== 1) {
-    if (mutableContent === true) {
-      aps['mutable-content'] = 1;
-    } else {
-      delete aps['mutable-content'];
-    }
-  }
-}
-
-/**
- * Checks if the given alert object is valid. Alert could be a string or a complex object.
- * If specified as an object, it must have valid localization parameters. If successful, transforms
- * the input object by renaming the keys to valid APNS payload keys.
- *
- * @param {string | ApsAlert} alert An alert string or an object to be validated.
- */
-function validateApsAlert(alert: string | ApsAlert) {
-  if (typeof alert === 'undefined' || validator.isString(alert)) {
-    return;
-  } else if (!validator.isNonNullObject(alert)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'apns.payload.aps.alert must be a string or a non-null object');
-  }
-
-  const apsAlert: ApsAlert = alert as ApsAlert;
-  if (validator.isNonEmptyArray(apsAlert.locArgs) &&
-      !validator.isNonEmptyString(apsAlert.locKey)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'apns.payload.aps.alert.locKey is required when specifying locArgs');
-  }
-  if (validator.isNonEmptyArray(apsAlert.titleLocArgs) &&
-      !validator.isNonEmptyString(apsAlert.titleLocKey)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'apns.payload.aps.alert.titleLocKey is required when specifying titleLocArgs');
-  }
-
-  const propertyMappings = {
-    locKey: 'loc-key',
-    locArgs: 'loc-args',
-    titleLocKey: 'title-loc-key',
-    titleLocArgs: 'title-loc-args',
-    actionLocKey: 'action-loc-key',
-    launchImage: 'launch-image',
-  };
-  renameProperties(apsAlert, propertyMappings);
-}
-
-/**
- * Checks if the given AndroidConfig object is valid. The object must have valid ttl, data,
- * and notification fields. If successful, transforms the input object by renaming keys to valid
- * Android keys. Also transforms the ttl value to the format expected by FCM service.
- *
- * @param {AndroidConfig} config An object to be validated.
- */
-function validateAndroidConfig(config: AndroidConfig) {
-  if (typeof config === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(config)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'android must be a non-null object');
-  }
-
-  if (typeof config.ttl !== 'undefined') {
-    if (!validator.isNumber(config.ttl) || config.ttl < 0) {
-      throw new FirebaseMessagingError(
-        MessagingClientErrorCode.INVALID_PAYLOAD,
-        'TTL must be a non-negative duration in milliseconds');
-    }
-    const seconds = Math.floor(config.ttl / 1000);
-    const nanos = (config.ttl - seconds * 1000) * 1000000;
-    let duration: string;
-    if (nanos > 0) {
-      let nanoString = nanos.toString();
-      while (nanoString.length < 9) {
-        nanoString = '0' + nanoString;
-      }
-      duration = `${seconds}.${nanoString}s`;
-    } else {
-      duration = `${seconds}s`;
-    }
-    (config as any).ttl = duration;
-  }
-  validateStringMap(config.data, 'android.data');
-  validateAndroidNotification(config.notification);
-
-  const propertyMappings = {
-    collapseKey: 'collapse_key',
-    restrictedPackageName: 'restricted_package_name',
-  };
-  renameProperties(config, propertyMappings);
-}
-
-/**
- * Checks if the given AndroidNotification object is valid. The object must have valid color and
- * localization parameters. If successful, transforms the input object by renaming keys to valid
- * Android keys.
- *
- * @param {AndroidNotification} notification An object to be validated.
- */
-function validateAndroidNotification(notification: AndroidNotification) {
-  if (typeof notification === 'undefined') {
-    return;
-  } else if (!validator.isNonNullObject(notification)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'android.notification must be a non-null object');
-  }
-
-  if (typeof notification.color !== 'undefined' && !/^#[0-9a-fA-F]{6}$/.test(notification.color)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'android.notification.color must be in the form #RRGGBB');
-  }
-  if (validator.isNonEmptyArray(notification.bodyLocArgs) &&
-      !validator.isNonEmptyString(notification.bodyLocKey)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'android.notification.bodyLocKey is required when specifying bodyLocArgs');
-  }
-  if (validator.isNonEmptyArray(notification.titleLocArgs) &&
-      !validator.isNonEmptyString(notification.titleLocKey)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'android.notification.titleLocKey is required when specifying titleLocArgs');
-  }
-
-  const propertyMappings = {
-    clickAction: 'click_action',
-    bodyLocKey: 'body_loc_key',
-    bodyLocArgs: 'body_loc_args',
-    titleLocKey: 'title_loc_key',
-    titleLocArgs: 'title_loc_args',
-  };
-  renameProperties(notification, propertyMappings);
-}
-
-/**
- * Checks if the given Message object is valid. Recursively validates all the child objects
- * included in the message (android, apns, data etc.). If successful, transforms the message
- * in place by renaming the keys to what's expected by the remote FCM service.
- *
- * @param {Message} Message An object to be validated.
- */
-function validateMessage(message: Message) {
-  if (!validator.isNonNullObject(message)) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD, 'Message must be a non-null object');
-  }
-
-  const anyMessage = message as any;
-  if (anyMessage.topic) {
-    // If the topic name is prefixed, remove it.
-    if (anyMessage.topic.startsWith('/topics/')) {
-      anyMessage.topic = anyMessage.topic.replace(/^\/topics\//, '');
-    }
-    // Checks for illegal characters and empty string.
-    if (!/^[a-zA-Z0-9-_.~%]+$/.test(anyMessage.topic)) {
-      throw new FirebaseMessagingError(
-        MessagingClientErrorCode.INVALID_PAYLOAD, 'Malformed topic name');
-    }
-  }
-
-  const targets = [anyMessage.token, anyMessage.topic, anyMessage.condition];
-  if (targets.filter((v) => validator.isNonEmptyString(v)).length !== 1) {
-    throw new FirebaseMessagingError(
-      MessagingClientErrorCode.INVALID_PAYLOAD,
-      'Exactly one of topic, token or condition is required');
-  }
-
-  validateStringMap(message.data, 'data');
-  validateAndroidConfig(message.android);
-  validateWebpushConfig(message.webpush);
-  validateApnsConfig(message.apns);
-}
-
-/* Payload for data messages */
-export interface DataMessagePayload {
-  [key: string]: string;
-}
-
-/* Payload for notification messages */
-export interface NotificationMessagePayload {
-  tag?: string;
-  body?: string;
-  icon?: string;
-  badge?: string;
-  color?: string;
-  sound?: string;
-  title?: string;
-  bodyLocKey?: string;
-  bodyLocArgs?: string;
-  clickAction?: string;
-  titleLocKey?: string;
-  titleLocArgs?: string;
-  [other: string]: string;
-}
-
-/* Composite messaging payload (data and notification payloads are both optional) */
-export interface MessagingPayload {
-  data?: DataMessagePayload;
-  notification?: NotificationMessagePayload;
-}
-
-/* Options that can passed along with messages */
-export interface MessagingOptions {
-  dryRun?: boolean;
-  priority?: string;
-  timeToLive?: number;
-  collapseKey?: string;
-  mutableContent?: boolean;
-  contentAvailable?: boolean;
-  restrictedPackageName?: string;
-  [other: string]: any;
-}
-
-/* Individual status response payload from single devices */
-export interface MessagingDeviceResult {
-  error?: FirebaseError;
-  messageId?: string;
-  canonicalRegistrationToken?: string;
-}
-
-/* Response payload from sending to a single device ID or array of device IDs */
-export interface MessagingDevicesResponse {
-  canonicalRegistrationTokenCount: number;
-  failureCount: number;
-  multicastId: number;
-  results: MessagingDeviceResult[];
-  successCount: number;
-}
-
-/* Response payload from sending to a device group */
-export interface MessagingDeviceGroupResponse {
-  successCount: number;
-  failureCount: number;
-  failedRegistrationTokens: string[];
-}
-
-/* Response payload from sending to a topic */
-export interface MessagingTopicResponse {
-  messageId: number;
-}
-
-/* Response payload from sending to a condition */
-export interface MessagingConditionResponse {
-  messageId: number;
-}
-
-
-/* Response payload from sending to a single registration token or array of registration tokens */
-export interface MessagingTopicManagementResponse {
-  failureCount: number;
-  successCount: number;
-  errors: FirebaseArrayIndexError[];
-}
-
-
 /**
  * Maps a raw FCM server response to a MessagingDevicesResponse object.
  *
@@ -583,7 +114,7 @@ function mapRawResponseToDevicesResponse(response: object): MessagingDevicesResp
   // Rename properties on the server response
   utils.renameProperties(response, MESSAGING_DEVICES_RESPONSE_KEYS_MAP);
   if ('results' in response) {
-    (response as any).results.forEach((messagingDeviceResult) => {
+    (response as any).results.forEach((messagingDeviceResult: any) => {
       utils.renameProperties(messagingDeviceResult, MESSAGING_DEVICE_RESULT_KEYS_MAP);
 
       // Map the FCM server's error strings to actual error objects.
@@ -632,9 +163,8 @@ function mapRawResponseToTopicManagementResponse(response: object): MessagingTop
     errors: [],
   };
 
-  const errors: FirebaseArrayIndexError[] = [];
   if ('results' in response) {
-    (response as any).results.forEach((tokenManagementResult, index) => {
+    (response as any).results.forEach((tokenManagementResult: any, index: number) => {
       // Map the FCM server's error strings to actual error objects.
       if ('error' in tokenManagementResult) {
         result.failureCount += 1;
@@ -656,35 +186,26 @@ function mapRawResponseToTopicManagementResponse(response: object): MessagingTop
 
 
 /**
- * Internals of a Messaging instance.
- */
-class MessagingInternals implements FirebaseServiceInternalsInterface {
-  /**
-   * Deletes the service and its associated resources.
-   *
-   * @return {Promise<()>} An empty Promise that will be fulfilled when the service is deleted.
-   */
-  public delete(): Promise<void> {
-    // There are no resources to clean up.
-    return Promise.resolve(undefined);
-  }
-}
-
-
-/**
  * Messaging service bound to the provided app.
  */
-export class Messaging implements FirebaseServiceInterface {
-
-  public INTERNAL: MessagingInternals = new MessagingInternals();
+export class Messaging implements MessagingInterface {
 
   private urlPath: string;
-  private appInternal: FirebaseApp;
-  private messagingRequestHandler: FirebaseMessagingRequestHandler;
+  private readonly appInternal: FirebaseApp;
+  private readonly messagingRequestHandler: FirebaseMessagingRequestHandler;
 
   /**
-   * @param {FirebaseApp} app The app for this Messaging service.
-   * @constructor
+   * Gets the {@link messaging.Messaging `Messaging`} service for the
+   * current app.
+   *
+   * @example
+   * ```javascript
+   * var messaging = app.messaging();
+   * // The above is shorthand for:
+   * // var messaging = admin.messaging(app);
+   * ```
+   *
+   * @return The `Messaging` service for the current app.
    */
   constructor(app: FirebaseApp) {
     if (!validator.isNonNullObject(app) || !('options' in app)) {
@@ -694,18 +215,6 @@ export class Messaging implements FirebaseServiceInterface {
       );
     }
 
-    const projectId: string = utils.getProjectId(app);
-    if (!validator.isNonEmptyString(projectId)) {
-      // Assert for an explicit projct ID (either via AppOptions or the cert itself).
-      throw new FirebaseMessagingError(
-        MessagingClientErrorCode.INVALID_ARGUMENT,
-        'Failed to determine project ID for Messaging. Initialize the '
-        + 'SDK with service account credentials or set project ID as an app option. '
-        + 'Alternatively set the GOOGLE_CLOUD_PROJECT environment variable.',
-      );
-    }
-
-    this.urlPath = `/v1/projects/${projectId}/messages:send`;
     this.appInternal = app;
     this.messagingRequestHandler = new FirebaseMessagingRequestHandler(app);
   }
@@ -720,12 +229,14 @@ export class Messaging implements FirebaseServiceInterface {
   }
 
   /**
-   * Sends a message via Firebase Cloud Messaging (FCM).
+   * Sends the given message via FCM.
    *
-   * @param {Message} message The message to be sent.
-   * @param {boolean=} dryRun Whether to send the message in the dry-run (validation only) mode.
-   *
-   * @return {Promise<string>} A Promise fulfilled with a message ID string.
+   * @param message The message payload.
+   * @param dryRun Whether to send the message in the dry-run
+   *   (validation only) mode.
+   * @return A promise fulfilled with a unique message ID
+   *   string after the message has been successfully handed off to the FCM
+   *   service for delivery.
    */
   public send(message: Message, dryRun?: boolean): Promise<string> {
     const copy: Message = deepCopy(message);
@@ -734,13 +245,13 @@ export class Messaging implements FirebaseServiceInterface {
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_ARGUMENT, 'dryRun must be a boolean');
     }
-    return Promise.resolve()
-      .then(() => {
-        const request: {message: Message, validate_only?: boolean} = {message: copy};
+    return this.getUrlPath()
+      .then((urlPath) => {
+        const request: { message: Message; validate_only?: boolean } = { message: copy };
         if (dryRun) {
           request.validate_only = true;
         }
-        return this.messagingRequestHandler.invokeRequestHandler(FCM_SEND_HOST, this.urlPath, request);
+        return this.messagingRequestHandler.invokeRequestHandler(FCM_SEND_HOST, urlPath, request);
       })
       .then((response) => {
         return (response as any).name;
@@ -748,21 +259,137 @@ export class Messaging implements FirebaseServiceInterface {
   }
 
   /**
-   * Sends an FCM message to a single device or an array of devices.
+   * Sends all the messages in the given array via Firebase Cloud Messaging.
+   * Employs batching to send the entire list as a single RPC call. Compared
+   * to the `send()` method, this method is a significantly more efficient way
+   * to send multiple messages.
    *
-   * @param {string|string[]} registrationTokenOrTokens The registration token or an array of
-   *     registration tokens for the device(s) to which to send the message.
-   * @param {MessagingPayload} payload The message payload.
-   * @param {MessagingOptions} [options = {}] Optional options to alter the message.
+   * The responses list obtained from the return value
+   * corresponds to the order of tokens in the `MulticastMessage`. An error
+   * from this method indicates a total failure -- i.e. none of the messages in
+   * the list could be sent. Partial failures are indicated by a `BatchResponse`
+   * return value.
    *
-   * @return {Promise<MessagingDevicesResponse|MessagingDeviceGroupResponse>} A Promise fulfilled
-   *     with the server's response after the message has been sent.
+   * @param messages A non-empty array
+   *   containing up to 500 messages.
+   * @param dryRun Whether to send the messages in the dry-run
+   *   (validation only) mode.
+   * @return A Promise fulfilled with an object representing the result of the
+   *   send operation.
+   */
+  public sendAll(messages: Message[], dryRun?: boolean): Promise<BatchResponse> {
+    if (validator.isArray(messages) && messages.constructor !== Array) {
+      // In more recent JS specs, an array-like object might have a constructor that is not of
+      // Array type. Our deepCopy() method doesn't handle them properly. Convert such objects to
+      // a regular array here before calling deepCopy(). See issue #566 for details.
+      messages = Array.from(messages);
+    }
+
+    const copy: Message[] = deepCopy(messages);
+    if (!validator.isNonEmptyArray(copy)) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT, 'messages must be a non-empty array');
+    }
+    if (copy.length > FCM_MAX_BATCH_SIZE) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT,
+        `messages list must not contain more than ${FCM_MAX_BATCH_SIZE} items`);
+    }
+    if (typeof dryRun !== 'undefined' && !validator.isBoolean(dryRun)) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT, 'dryRun must be a boolean');
+    }
+
+    return this.getUrlPath()
+      .then((urlPath) => {
+        const requests: SubRequest[] = copy.map((message) => {
+          validateMessage(message);
+          const request: { message: Message; validate_only?: boolean } = { message };
+          if (dryRun) {
+            request.validate_only = true;
+          }
+          return {
+            url: `https://${FCM_SEND_HOST}${urlPath}`,
+            body: request,
+          };
+        });
+        return this.messagingRequestHandler.sendBatchRequest(requests);
+      });
+  }
+
+  /**
+   * Sends the given multicast message to all the FCM registration tokens
+   * specified in it.
+   *
+   * This method uses the `sendAll()` API under the hood to send the given
+   * message to all the target recipients. The responses list obtained from the
+   * return value corresponds to the order of tokens in the `MulticastMessage`.
+   * An error from this method indicates a total failure -- i.e. the message was
+   * not sent to any of the tokens in the list. Partial failures are indicated by
+   * a `BatchResponse` return value.
+   *
+   * @param message A multicast message
+   *   containing up to 500 tokens.
+   * @param dryRun Whether to send the message in the dry-run
+   *   (validation only) mode.
+   * @return A Promise fulfilled with an object representing the result of the
+   *   send operation.
+   */
+  public sendMulticast(message: MulticastMessage, dryRun?: boolean): Promise<BatchResponse> {
+    const copy: MulticastMessage = deepCopy(message);
+    if (!validator.isNonNullObject(copy)) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT, 'MulticastMessage must be a non-null object');
+    }
+    if (!validator.isNonEmptyArray(copy.tokens)) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT, 'tokens must be a non-empty array');
+    }
+    if (copy.tokens.length > FCM_MAX_BATCH_SIZE) {
+      throw new FirebaseMessagingError(
+        MessagingClientErrorCode.INVALID_ARGUMENT,
+        `tokens list must not contain more than ${FCM_MAX_BATCH_SIZE} items`);
+    }
+
+    const messages: Message[] = copy.tokens.map((token) => {
+      return {
+        token,
+        android: copy.android,
+        apns: copy.apns,
+        data: copy.data,
+        notification: copy.notification,
+        webpush: copy.webpush,
+        fcmOptions: copy.fcmOptions,
+      };
+    });
+    return this.sendAll(messages, dryRun);
+  }
+
+  /**
+   * Sends an FCM message to a single device corresponding to the provided
+   * registration token.
+   *
+   * See
+   * [Send to individual devices](/docs/cloud-messaging/admin/legacy-fcm#send_to_individual_devices)
+   * for code samples and detailed documentation. Takes either a
+   * `registrationToken` to send to a single device or a
+   * `registrationTokens` parameter containing an array of tokens to send
+   * to multiple devices.
+   *
+   * @param registrationToken A device registration token or an array of
+   *   device registration tokens to which the message should be sent.
+   * @param payload The message payload.
+   * @param options Optional options to
+   *   alter the message.
+   *
+   * @return A promise fulfilled with the server's response after the message
+   *   has been sent.
    */
   public sendToDevice(
     registrationTokenOrTokens: string | string[],
     payload: MessagingPayload,
     options: MessagingOptions = {},
-  ): Promise<MessagingDevicesResponse | MessagingDeviceGroupResponse> {
+  ): Promise<MessagingDevicesResponse> {
     // Validate the input argument types. Since these are common developer errors when getting
     // started, throw an error instead of returning a rejected promise.
     this.validateRegistrationTokensType(
@@ -800,27 +427,39 @@ export class Messaging implements FirebaseServiceInterface {
         if ('multicast_id' in response) {
           return mapRawResponseToDevicesResponse(response);
         } else {
-          return mapRawResponseToDeviceGroupResponse(response);
+          const groupResponse = mapRawResponseToDeviceGroupResponse(response);
+          return {
+            ...groupResponse,
+            canonicalRegistrationTokenCount: -1,
+            multicastId: -1,
+            results: [],
+          }
         }
       });
   }
 
   /**
-   * Sends an FCM message to a device group.
+   * Sends an FCM message to a device group corresponding to the provided
+   * notification key.
    *
-   * @param {string} notificationKey The notification key representing the device group to which to
-   *     send the message.
-   * @param {MessagingPayload} payload The message payload.
-   * @param {MessagingOptions} [options = {}] Optional options to alter the message.
+   * See
+   * [Send to a device group](/docs/cloud-messaging/admin/legacy-fcm#send_to_a_device_group)
+   * for code samples and detailed documentation.
    *
-   * @return {Promise<MessagingDeviceGroupResponse|MessagingDevicesResponse>} A Promise fulfilled
-   *     with the server's response after the message has been sent.
+   * @param notificationKey The notification key for the device group to
+   *   which to send the message.
+   * @param payload The message payload.
+   * @param options Optional options to
+   *   alter the message.
+   *
+   * @return A promise fulfilled with the server's response after the message
+   *   has been sent.
    */
   public sendToDeviceGroup(
     notificationKey: string,
     payload: MessagingPayload,
     options: MessagingOptions = {},
-  ): Promise<MessagingDeviceGroupResponse | MessagingDevicesResponse> {
+  ): Promise<MessagingDeviceGroupResponse> {
     if (!validator.isNonEmptyString(notificationKey)) {
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_RECIPIENT,
@@ -872,7 +511,11 @@ export class Messaging implements FirebaseServiceInterface {
               'Notification key provided to sendToDeviceGroup() is invalid.',
             );
           } else {
-            return mapRawResponseToDevicesResponse(response);
+            const devicesResponse = mapRawResponseToDevicesResponse(response);
+            return {
+              ...devicesResponse,
+              failedRegistrationTokens: [],
+            }
           }
         }
 
@@ -883,12 +526,17 @@ export class Messaging implements FirebaseServiceInterface {
   /**
    * Sends an FCM message to a topic.
    *
-   * @param {string} topic The name of the topic to which to send the message.
-   * @param {MessagingPayload} payload The message payload.
-   * @param {MessagingOptions} [options = {}] Optional options to alter the message.
+   * See
+   * [Send to a topic](/docs/cloud-messaging/admin/legacy-fcm#send_to_a_topic)
+   * for code samples and detailed documentation.
    *
-   * @return {Promise<MessagingTopicResponse>} A Promise fulfilled with the server's response after
-   *     the message has been sent.
+   * @param topic The topic to which to send the message.
+   * @param payload The message payload.
+   * @param options Optional options to
+   *   alter the message.
+   *
+   * @return A promise fulfilled with the server's response after the message
+   *   has been sent.
    */
   public sendToTopic(
     topic: string,
@@ -928,12 +576,18 @@ export class Messaging implements FirebaseServiceInterface {
   /**
    * Sends an FCM message to a condition.
    *
-   * @param {string} condition The condition to which to send the message.
-   * @param {MessagingPayload} payload The message payload.
-   * @param {MessagingOptions} [options = {}] Optional options to alter the message.
+   * See
+   * [Send to a condition](/docs/cloud-messaging/admin/legacy-fcm#send_to_a_condition)
+   * for code samples and detailed documentation.
    *
-   * @return {Promise<MessagingConditionResponse>} A Promise fulfilled with the server's response
-   *     after the message has been sent.
+   * @param condition The condition determining to which topics to send
+   *   the message.
+   * @param payload The message payload.
+   * @param options Optional options to
+   *   alter the message.
+   *
+   * @return A promise fulfilled with the server's response after the message
+   *   has been sent.
    */
   public sendToCondition(
     condition: string,
@@ -978,14 +632,19 @@ export class Messaging implements FirebaseServiceInterface {
   }
 
   /**
-   * Subscribes a single device or an array of devices to a topic.
+   * Subscribes a device to an FCM topic.
    *
-   * @param {string|string[]} registrationTokenOrTokens The registration token or an array of
-   *     registration tokens to subscribe to the topic.
-   * @param {string} topic The topic to which to subscribe.
+   * See [Subscribe to a
+   * topic](/docs/cloud-messaging/manage-topics#suscribe_and_unsubscribe_using_the)
+   * for code samples and detailed documentation. Optionally, you can provide an
+   * array of tokens to subscribe multiple devices.
    *
-   * @return {Promise<MessagingTopicManagementResponse>} A Promise fulfilled with the parsed FCM
-   *   server response.
+   * @param registrationTokens A token or array of registration tokens
+   *   for the devices to subscribe to the topic.
+   * @param topic The topic to which to subscribe.
+   *
+   * @return A promise fulfilled with the server's response after the device has been
+   *   subscribed to the topic.
    */
   public subscribeToTopic(
     registrationTokenOrTokens: string | string[],
@@ -1000,14 +659,19 @@ export class Messaging implements FirebaseServiceInterface {
   }
 
   /**
-   * Unsubscribes a single device or an array of devices from a topic.
+   * Unsubscribes a device from an FCM topic.
    *
-   * @param {string|string[]} registrationTokenOrTokens The registration token or an array of
-   *     registration tokens to unsubscribe from the topic.
-   * @param {string} topic The topic to which to subscribe.
+   * See [Unsubscribe from a
+   * topic](/docs/cloud-messaging/admin/manage-topic-subscriptions#unsubscribe_from_a_topic)
+   * for code samples and detailed documentation.  Optionally, you can provide an
+   * array of tokens to unsubscribe multiple devices.
    *
-   * @return {Promise<MessagingTopicManagementResponse>} A Promise fulfilled with the parsed FCM
-   *   server response.
+   * @param registrationTokens A device registration token or an array of
+   *   device registration tokens to unsubscribe from the topic.
+   * @param topic The topic from which to unsubscribe.
+   *
+   * @return A promise fulfilled with the server's response after the device has been
+   *   unsubscribed from the topic.
    */
   public unsubscribeFromTopic(
     registrationTokenOrTokens: string | string[],
@@ -1019,6 +683,28 @@ export class Messaging implements FirebaseServiceInterface {
       'unsubscribeFromTopic',
       FCM_TOPIC_MANAGEMENT_REMOVE_PATH,
     );
+  }
+
+  private getUrlPath(): Promise<string> {
+    if (this.urlPath) {
+      return Promise.resolve(this.urlPath);
+    }
+
+    return utils.findProjectId(this.app)
+      .then((projectId) => {
+        if (!validator.isNonEmptyString(projectId)) {
+          // Assert for an explicit project ID (either via AppOptions or the cert itself).
+          throw new FirebaseMessagingError(
+            MessagingClientErrorCode.INVALID_ARGUMENT,
+            'Failed to determine project ID for Messaging. Initialize the '
+            + 'SDK with service account credentials or set project ID as an app option. '
+            + 'Alternatively set the GOOGLE_CLOUD_PROJECT environment variable.',
+          );
+        }
+
+        this.urlPath = `/v1/projects/${projectId}/messages:send`;
+        return this.urlPath;
+      });
   }
 
   /**
@@ -1081,7 +767,7 @@ export class Messaging implements FirebaseServiceInterface {
   private validateMessagingPayloadAndOptionsTypes(
     payload: MessagingPayload,
     options: MessagingOptions,
-  ) {
+  ): void {
     // Validate the payload is an object
     if (!validator.isNonNullObject(payload)) {
       throw new FirebaseMessagingError(
@@ -1107,7 +793,7 @@ export class Messaging implements FirebaseServiceInterface {
    * @return {MessagingPayload} A copy of the provided payload with whitelisted properties switched
    *     from camelCase to underscore_case.
    */
-  private validateMessagingPayload(payload: MessagingPayload) {
+  private validateMessagingPayload(payload: MessagingPayload): MessagingPayload {
     const payloadCopy: MessagingPayload = deepCopy(payload);
 
     const payloadKeys = Object.keys(payloadCopy);
@@ -1119,8 +805,8 @@ export class Messaging implements FirebaseServiceInterface {
       if (validPayloadKeys.indexOf(payloadKey) === -1) {
         throw new FirebaseMessagingError(
           MessagingClientErrorCode.INVALID_PAYLOAD,
-          `Messaging payload contains an invalid "${ payloadKey }" property. Valid properties are ` +
-          `"data" and "notification".`,
+          `Messaging payload contains an invalid "${payloadKey}" property. Valid properties are ` +
+          '"data" and "notification".',
         );
       } else {
         containsDataOrNotificationKey = true;
@@ -1135,15 +821,13 @@ export class Messaging implements FirebaseServiceInterface {
       );
     }
 
-    payloadKeys.forEach((payloadKey) => {
-      const value = payloadCopy[payloadKey];
-
+    const validatePayload = (payloadKey: string, value: DataMessagePayload | NotificationMessagePayload): void => {
       // Validate each top-level key in the payload is an object
       if (!validator.isNonNullObject(value)) {
         throw new FirebaseMessagingError(
           MessagingClientErrorCode.INVALID_PAYLOAD,
-          `Messaging payload contains an invalid value for the "${ payloadKey }" property. ` +
-          `Value must be an object.`,
+          `Messaging payload contains an invalid value for the "${payloadKey}" property. ` +
+          'Value must be an object.',
         );
       }
 
@@ -1152,33 +836,40 @@ export class Messaging implements FirebaseServiceInterface {
           // Validate all sub-keys have a string value
           throw new FirebaseMessagingError(
             MessagingClientErrorCode.INVALID_PAYLOAD,
-            `Messaging payload contains an invalid value for the "${ payloadKey }.${ subKey }" ` +
-            `property. Values must be strings.`,
+            `Messaging payload contains an invalid value for the "${payloadKey}.${subKey}" ` +
+            'property. Values must be strings.',
           );
         } else if (payloadKey === 'data' && /^google\./.test(subKey)) {
           // Validate the data payload does not contain keys which start with 'google.'.
           throw new FirebaseMessagingError(
             MessagingClientErrorCode.INVALID_PAYLOAD,
-            `Messaging payload contains the blacklisted "data.${ subKey }" property.`,
+            `Messaging payload contains the blacklisted "data.${subKey}" property.`,
           );
         }
       });
-    });
+    };
+
+    if (payloadCopy.data !== undefined) {
+      validatePayload('data', payloadCopy.data);
+    }
+    if (payloadCopy.notification !== undefined) {
+      validatePayload('notification', payloadCopy.notification);
+    }
 
     // Validate the data payload object does not contain blacklisted properties
     if ('data' in payloadCopy) {
       BLACKLISTED_DATA_PAYLOAD_KEYS.forEach((blacklistedKey) => {
-        if (blacklistedKey in payloadCopy.data) {
+        if (blacklistedKey in payloadCopy.data!) {
           throw new FirebaseMessagingError(
             MessagingClientErrorCode.INVALID_PAYLOAD,
-            `Messaging payload contains the blacklisted "data.${ blacklistedKey }" property.`,
+            `Messaging payload contains the blacklisted "data.${blacklistedKey}" property.`,
           );
         }
       });
     }
 
     // Convert whitelisted camelCase keys to underscore_case
-    if ('notification' in payloadCopy) {
+    if (payloadCopy.notification) {
       utils.renameProperties(payloadCopy.notification, CAMELCASED_NOTIFICATION_PAYLOAD_KEYS_MAP);
     }
 
@@ -1193,7 +884,7 @@ export class Messaging implements FirebaseServiceInterface {
    * @return {MessagingOptions} A copy of the provided options with whitelisted properties switched
    *   from camelCase to underscore_case.
    */
-  private validateMessagingOptions(options: MessagingOptions) {
+  private validateMessagingOptions(options: MessagingOptions): MessagingOptions {
     const optionsCopy: MessagingOptions = deepCopy(options);
 
     // Validate the options object does not contain blacklisted properties
@@ -1201,7 +892,7 @@ export class Messaging implements FirebaseServiceInterface {
       if (blacklistedKey in optionsCopy) {
         throw new FirebaseMessagingError(
           MessagingClientErrorCode.INVALID_OPTIONS,
-          `Messaging options contains the blacklisted "${ blacklistedKey }" property.`,
+          `Messaging options contains the blacklisted "${blacklistedKey}" property.`,
         );
       }
     });
@@ -1214,14 +905,14 @@ export class Messaging implements FirebaseServiceInterface {
       const keyName = ('collapseKey' in options) ? 'collapseKey' : 'collapse_key';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a non-empty string.',
       );
     } else if ('dry_run' in optionsCopy && !validator.isBoolean((optionsCopy as any).dry_run)) {
       const keyName = ('dryRun' in options) ? 'dryRun' : 'dry_run';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a boolean.',
       );
     } else if ('priority' in optionsCopy && !validator.isNonEmptyString(optionsCopy.priority)) {
@@ -1231,32 +922,32 @@ export class Messaging implements FirebaseServiceInterface {
         'be a non-empty string.',
       );
     } else if ('restricted_package_name' in optionsCopy &&
-               !validator.isNonEmptyString((optionsCopy as any).restricted_package_name)) {
+      !validator.isNonEmptyString((optionsCopy as any).restricted_package_name)) {
       const keyName = ('restrictedPackageName' in options) ? 'restrictedPackageName' : 'restricted_package_name';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a non-empty string.',
       );
     } else if ('time_to_live' in optionsCopy && !validator.isNumber((optionsCopy as any).time_to_live)) {
       const keyName = ('timeToLive' in options) ? 'timeToLive' : 'time_to_live';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a number.',
       );
     } else if ('content_available' in optionsCopy && !validator.isBoolean((optionsCopy as any).content_available)) {
       const keyName = ('contentAvailable' in options) ? 'contentAvailable' : 'content_available';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a boolean.',
       );
     } else if ('mutable_content' in optionsCopy && !validator.isBoolean((optionsCopy as any).mutable_content)) {
       const keyName = ('mutableContent' in options) ? 'mutableContent' : 'mutable_content';
       throw new FirebaseMessagingError(
         MessagingClientErrorCode.INVALID_OPTIONS,
-        `Messaging options contains an invalid value for the "${ keyName }" property. Value must ` +
+        `Messaging options contains an invalid value for the "${keyName}" property. Value must ` +
         'be a boolean.',
       );
     }
@@ -1275,9 +966,9 @@ export class Messaging implements FirebaseServiceInterface {
     registrationTokenOrTokens: string | string[],
     methodName: string,
     errorInfo: ErrorInfo = MessagingClientErrorCode.INVALID_ARGUMENT,
-  ) {
+  ): void {
     if (!validator.isNonEmptyArray(registrationTokenOrTokens) &&
-        !validator.isNonEmptyString(registrationTokenOrTokens)) {
+      !validator.isNonEmptyString(registrationTokenOrTokens)) {
       throw new FirebaseMessagingError(
         errorInfo,
         `Registration token(s) provided to ${methodName}() must be a non-empty string or a ` +
@@ -1298,7 +989,7 @@ export class Messaging implements FirebaseServiceInterface {
     registrationTokenOrTokens: string | string[],
     methodName: string,
     errorInfo: ErrorInfo = MessagingClientErrorCode.INVALID_ARGUMENT,
-  ) {
+  ): void {
     if (validator.isArray(registrationTokenOrTokens)) {
       // Validate the array contains no more than 1,000 registration tokens.
       if (registrationTokenOrTokens.length > 1000) {
@@ -1333,7 +1024,7 @@ export class Messaging implements FirebaseServiceInterface {
     topic: string | string[],
     methodName: string,
     errorInfo: ErrorInfo = MessagingClientErrorCode.INVALID_ARGUMENT,
-  ) {
+  ): void {
     if (!validator.isNonEmptyString(topic)) {
       throw new FirebaseMessagingError(
         errorInfo,
@@ -1354,7 +1045,7 @@ export class Messaging implements FirebaseServiceInterface {
     topic: string,
     methodName: string,
     errorInfo: ErrorInfo = MessagingClientErrorCode.INVALID_ARGUMENT,
-  ) {
+  ): void {
     if (!validator.isTopic(topic)) {
       throw new FirebaseMessagingError(
         errorInfo,
@@ -1371,9 +1062,9 @@ export class Messaging implements FirebaseServiceInterface {
    *
    * @return {string} The normalized topic name.
    */
-  private normalizeTopic(topic: string) {
+  private normalizeTopic(topic: string): string {
     if (!/^\/topics\//.test(topic)) {
-      topic = `/topics/${ topic }`;
+      topic = `/topics/${topic}`;
     }
     return topic;
   }

@@ -5,6 +5,7 @@ npm-debug.log
 
 lib/
 .tmp/
+temp/
 typings/
 coverage/
 node_modules/
@@ -16,3 +17,5 @@ test/resources/apikey.txt
 
 # Release tarballs should not be checked in
 firebase-admin-*.tgz
+
+docgen/html/

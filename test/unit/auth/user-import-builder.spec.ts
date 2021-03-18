@@ -18,13 +18,17 @@ import * as chai from 'chai';
 import * as sinonChai from 'sinon-chai';
 import * as chaiAsPromised from 'chai-as-promised';
 
-import {deepCopy, deepExtend} from '../../../src/utils/deep-copy';
+import { deepCopy } from '../../../src/utils/deep-copy';
 import {
-  UserImportBuilder, UserImportResult, UserImportOptions, UserImportRecord,
+  UserImportBuilder, ValidatorFunction, UploadAccountRequest,
 } from '../../../src/auth/user-import-builder';
-import {AuthClientErrorCode, FirebaseAuthError} from '../../../src/utils/error';
-import {toWebSafeBase64} from '../../../src/utils';
+import { AuthClientErrorCode, FirebaseAuthError } from '../../../src/utils/error';
+import { toWebSafeBase64 } from '../../../src/utils';
+import { auth } from '../../../src/auth/index';
 
+import UpdatePhoneMultiFactorInfoRequest = auth.UpdatePhoneMultiFactorInfoRequest;
+import UserImportResult = auth.UserImportResult;
+import UserImportRecord = auth.UserImportRecord;
 
 chai.should();
 chai.use(sinonChai);
@@ -32,12 +36,24 @@ chai.use(chaiAsPromised);
 
 const expect = chai.expect;
 
+export function expectUserImportResult(result: UserImportResult, expected: UserImportResult): void {
+  expect(result.successCount).to.equal(expected.successCount);
+  expect(result.failureCount).to.equal(expected.failureCount);
+  expect(result.errors.length).to.equal(expected.errors.length);
+  result.errors.forEach((err, idx) => {
+    const want = expected.errors[idx];
+    expect(err.index).to.equal(want.index);
+    expect(err.error).to.deep.include(want.error);
+  });
+}
+
 describe('UserImportBuilder', () => {
-  const nowString = new Date().toUTCString();
-  const userRequestValidator = (request) => {
+  const now = new Date('2019-10-25T04:30:52.000Z');
+  const nowString = now.toUTCString();
+  const userRequestValidator: ValidatorFunction = () => {
     // Do not throw an error.
   };
-  const userRequestValidatorWithError = (request) => {
+  const userRequestValidatorWithError: ValidatorFunction = (request) => {
     // Simulate a validation error is thrown for a specific user.
     if (request.localId === '5678') {
       throw new FirebaseAuthError(
@@ -67,7 +83,8 @@ describe('UserImportBuilder', () => {
           providerId: 'google.com',
         },
       ],
-      customClaims: {admin: true},
+      customClaims: { admin: true },
+      tenantId: 'TENANT-ID',
     },
     {
       uid: '9012',
@@ -75,7 +92,29 @@ describe('UserImportBuilder', () => {
       passwordHash: Buffer.from('userpass'),
       passwordSalt: Buffer.from('NaCl'),
     },
-    {uid: '5678', phoneNumber: '+16505550101'},
+    { uid: '5678', phoneNumber: '+16505550101' },
+    {
+      uid: '3456',
+      email: 'janedoe@example.com',
+      passwordHash: Buffer.from('password'),
+      passwordSalt: Buffer.from('NaCl'),
+      multiFactor: {
+        enrolledFactors: [
+          {
+            uid: 'enrolledSecondFactor1',
+            phoneNumber: '+16505557348',
+            displayName: 'Spouse\'s phone number',
+            factorId: 'phone',
+            enrollmentTime: now.toUTCString(),
+          },
+          {
+            uid: 'enrolledSecondFactor2',
+            phoneNumber: '+16505551000',
+            factorId: 'phone',
+          },
+        ],
+      },
+    },
   ];
   const expectedUsersRequest = [
     {
@@ -97,7 +136,8 @@ describe('UserImportBuilder', () => {
           providerId: 'google.com',
         },
       ],
-      customAttributes: JSON.stringify({admin: true}),
+      customAttributes: JSON.stringify({ admin: true }),
+      tenantId: 'TENANT-ID',
     },
     {
       localId: '9012',
@@ -109,18 +149,44 @@ describe('UserImportBuilder', () => {
       localId: '5678',
       phoneNumber: '+16505550101',
     },
+    {
+      localId: '3456',
+      email: 'janedoe@example.com',
+      passwordHash: toWebSafeBase64(Buffer.from('password')),
+      salt: toWebSafeBase64(Buffer.from('NaCl')),
+      mfaInfo: [
+        {
+          mfaEnrollmentId: 'enrolledSecondFactor1',
+          phoneInfo: '+16505557348',
+          displayName: 'Spouse\'s phone number',
+          enrolledAt: now.toISOString(),
+        },
+        {
+          mfaEnrollmentId: 'enrolledSecondFactor2',
+          phoneInfo: '+16505551000',
+        },
+      ],
+    },
   ];
 
-  const options = {
-    hash: {
-      algorithm: 'BCRYPT' as any,
-    },
-  };
   const hmacAlgorithms = ['HMAC_SHA512', 'HMAC_SHA256', 'HMAC_SHA1', 'HMAC_MD5'];
   const md5ShaPbkdfAlgorithms = [
     'MD5', 'SHA1', 'SHA256', 'SHA512', 'PBKDF_SHA1', 'PBKDF2_SHA256',
   ];
   describe('constructor', () =>  {
+    const invalidUserImportOptions = [10, 'invalid', undefined, null, true, ['a']];
+    invalidUserImportOptions.forEach((invalidOption) => {
+      it(`should throw when non-object ${JSON.stringify(invalidOption)} UserImportOptions is provided`, () => {
+        const expectedError = new FirebaseAuthError(
+          AuthClientErrorCode.INVALID_ARGUMENT,
+          '"UserImportOptions" are required when importing users with passwords.',
+        );
+        expect(() =>  {
+          return new UserImportBuilder(users, invalidOption as any, userRequestValidator);
+        }).to.throw(expectedError.message);
+      });
+    });
+
     it('should throw when an empty hash algorithm is provided', () => {
       const expectedError = new FirebaseAuthError(
         AuthClientErrorCode.MISSING_HASH_ALGORITHM,
@@ -134,7 +200,7 @@ describe('UserImportBuilder', () => {
     it('should throw when an invalid hash algorithm is provided', () => {
       const expectedError = new FirebaseAuthError(
         AuthClientErrorCode.INVALID_HASH_ALGORITHM,
-        `Unsupported hash algorithm provider "invalid".`,
+        'Unsupported hash algorithm provider "invalid".',
       );
       const invalidOptions = {
         hash: {
@@ -148,8 +214,8 @@ describe('UserImportBuilder', () => {
 
     it('should not throw when no hash options are provided and no hashing is needed', () => {
       const noHashUsers = [
-        {uid: '1234', email: 'user@example.com'},
-        {uid: '5678', phoneNumber: '+16505550101'},
+        { uid: '1234', email: 'user@example.com' },
+        { uid: '5678', phoneNumber: '+16505550101' },
       ];
       expect(() =>  {
         return new UserImportBuilder(noHashUsers, undefined, userRequestValidator);
@@ -163,7 +229,7 @@ describe('UserImportBuilder', () => {
           it(`should throw when non-Buffer ${JSON.stringify(key)} hash key is provided`, () => {
             const expectedError = new FirebaseAuthError(
               AuthClientErrorCode.INVALID_HASH_KEY,
-              `A non-empty "hash.key" byte buffer must be provided for ` +
+              'A non-empty "hash.key" byte buffer must be provided for ' +
               `hash algorithm ${algorithm}.`,
             );
             const invalidOptions = {
@@ -215,12 +281,34 @@ describe('UserImportBuilder', () => {
 
     md5ShaPbkdfAlgorithms.forEach((algorithm) => {
       describe(`${algorithm}`, () => {
-        const invalidRounds = [-1, 120001, 'invalid', undefined, null];
+        let minRounds: number;
+        let maxRounds: number;
+        switch (algorithm) {
+        case 'MD5':
+          minRounds = 0;
+          maxRounds = 8192;
+          break;
+        case 'SHA1':
+        case 'SHA256':
+        case 'SHA512':
+          minRounds = 1;
+          maxRounds = 8192;
+          break;
+        case 'PBKDF_SHA1':
+        case 'PBKDF2_SHA256':
+          minRounds = 0;
+          maxRounds = 120000;
+          break;
+        default:
+          throw new Error('Unexpected algorithm: ' + algorithm);
+        }
+        const invalidRounds = [minRounds - 1, maxRounds + 1, 'invalid', undefined, null];
+
         invalidRounds.forEach((rounds) => {
           it(`should throw when ${JSON.stringify(rounds)} rounds provided`, () => {
             const expectedError = new FirebaseAuthError(
               AuthClientErrorCode.INVALID_HASH_ROUNDS,
-              `A valid "hash.rounds" number between 0 and 120000 must be provided for ` +
+              `A valid "hash.rounds" number between ${minRounds} and ${maxRounds} must be provided for ` +
               `hash algorithm ${algorithm}.`,
             );
             const invalidOptions = {
@@ -255,12 +343,12 @@ describe('UserImportBuilder', () => {
           const validOptions = {
             hash: {
               algorithm,
-              rounds: 120000,
+              rounds: maxRounds,
             },
           };
           const expectedRequest = {
             hashAlgorithm: algorithm,
-            rounds: 120000,
+            rounds: maxRounds,
             users: expectedUsersRequest,
           };
           if (algorithm !== 'PBKDF_SHA1' && algorithm !== 'PBKDF2_SHA256') {
@@ -285,7 +373,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(key)} key provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_KEY,
-            `A "hash.key" byte buffer must be provided for ` +
+            'A "hash.key" byte buffer must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -306,7 +394,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(rounds)} rounds provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_ROUNDS,
-            `A valid "hash.rounds" number between 1 and 8 must be provided for ` +
+            'A valid "hash.rounds" number between 1 and 8 must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -327,7 +415,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(memoryCost)} memoryCost provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_MEMORY_COST,
-            `A valid "hash.memoryCost" number between 1 and 14 must be provided for ` +
+            'A valid "hash.memoryCost" number between 1 and 14 must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -348,7 +436,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(saltSeparator)} saltSeparator provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_SALT_SEPARATOR,
-            `"hash.saltSeparator" must be a byte buffer.`,
+            '"hash.saltSeparator" must be a byte buffer.',
           );
           const invalidOptions = {
             hash: {
@@ -416,7 +504,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(memoryCost)} memoryCost provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_MEMORY_COST,
-            `A valid "hash.memoryCost" number must be provided for ` +
+            'A valid "hash.memoryCost" number must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -438,7 +526,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(parallelization)} parallelization provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_MEMORY_COST,
-            `A valid "hash.parallelization" number must be provided for ` +
+            'A valid "hash.parallelization" number must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -460,7 +548,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(blockSize)} blockSize provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_BLOCK_SIZE,
-            `A valid "hash.blockSize" number must be provided for ` +
+            'A valid "hash.blockSize" number must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -482,7 +570,7 @@ describe('UserImportBuilder', () => {
         it(`should throw when ${JSON.stringify(derivedKeyLength)} dkLen provided`, () => {
           const expectedError = new FirebaseAuthError(
             AuthClientErrorCode.INVALID_HASH_DERIVED_KEY_LENGTH,
-            `A valid "hash.derivedKeyLength" number must be provided for ` +
+            'A valid "hash.derivedKeyLength" number must be provided for ' +
             `hash algorithm ${algorithm}.`,
           );
           const invalidOptions = {
@@ -556,12 +644,14 @@ describe('UserImportBuilder', () => {
         } as any,
       );
       testUsers.push(
-        {uid: 'INVALID2', email: 'other@domain.com', passwordHash: 'not a buffer'} as any,
+        { uid: 'INVALID2', email: 'other@domain.com', passwordHash: 'not a buffer' } as any,
       );
       const expectedRequest = {
         hashAlgorithm: algorithm,
         // The third user will be removed due to client side error.
-        users: [expectedUsersRequest[0], expectedUsersRequest[1]],
+        users: [
+          expectedUsersRequest[0], expectedUsersRequest[1], expectedUsersRequest[3],
+        ],
       };
       const userImportBuilder =
           new UserImportBuilder(users, validOptions as any, userRequestValidatorWithError);
@@ -570,17 +660,87 @@ describe('UserImportBuilder', () => {
 
     it('should return expected request with no hash options when not required', () => {
       const noHashUsers = [
-        {uid: '1234', email: 'user@example.com'},
-        {uid: '5678', phoneNumber: '+16505550101'},
+        { uid: '1234', email: 'user@example.com' },
+        { uid: '5678', phoneNumber: '+16505550101' },
       ];
       const expectedRequest = {
         users: [
-          {localId: '1234', email: 'user@example.com'},
-          {localId: '5678', phoneNumber: '+16505550101'},
+          { localId: '1234', email: 'user@example.com' },
+          { localId: '5678', phoneNumber: '+16505550101' },
         ],
       };
       const userImportBuilder =
           new UserImportBuilder(noHashUsers, validOptions as any, userRequestValidator);
+      expect(userImportBuilder.buildRequest()).to.deep.equal(expectedRequest);
+    });
+
+    it('should return expected request with no multi-factor fields when not available', () => {
+      const noMultiFactorUsers: any[] = [
+        { uid: '1234', email: 'user@example.com', multiFactor: null },
+        { uid: '5678', phoneNumber: '+16505550101', multiFactor: { enrolledFactors: [] } },
+      ];
+      const expectedRequest = {
+        users: [
+          { localId: '1234', email: 'user@example.com' },
+          { localId: '5678', phoneNumber: '+16505550101' },
+        ],
+      };
+      const userImportBuilder =
+          new UserImportBuilder(noMultiFactorUsers, validOptions as any, userRequestValidator);
+      expect(userImportBuilder.buildRequest()).to.deep.equal(expectedRequest);
+    });
+
+    it('should ignore users with invalid second factor enrollment time', () => {
+      const phoneFactor: UpdatePhoneMultiFactorInfoRequest = {
+        uid: 'enrolledSecondFactor1',
+        phoneNumber: '+16505557348',
+        displayName: 'Spouse\'s phone number',
+        factorId: 'phone',
+        enrollmentTime: 'invalid',
+      };
+      const invalidMultiFactorUsers: UserImportRecord[] = [
+        {
+          uid: '1234',
+          multiFactor: {
+            enrolledFactors: [ phoneFactor ],
+          },
+        },
+        { uid: '5678', phoneNumber: '+16505550102' },
+      ];
+      const expectedRequest: UploadAccountRequest = {
+        users: [
+          { localId: '5678', phoneNumber: '+16505550102' },
+        ],
+      };
+      const userImportBuilder =
+          new UserImportBuilder(invalidMultiFactorUsers, validOptions as any, userRequestValidator);
+      expect(userImportBuilder.buildRequest()).to.deep.equal(expectedRequest);
+    });
+
+    it('should ignore users with unsupported second factors', () => {
+      const invalidMultiFactorUsers: any = [
+        {
+          uid: '1234',
+          multiFactor: {
+            enrolledFactors: [
+              {
+                uid: 'enrolledSecondFactor1',
+                secret: 'SECRET',
+                displayName: 'Google Authenticator on personal phone',
+                factorId: 'totp',
+              },
+            ],
+          },
+        },
+        { uid: '5678', phoneNumber: '+16505550102' },
+      ];
+      const expectedRequest: UploadAccountRequest = {
+        users: [
+          { localId: '5678', phoneNumber: '+16505550102' },
+        ],
+      };
+      const userImportBuilder =
+          new UserImportBuilder(invalidMultiFactorUsers, validOptions as any, userRequestValidator);
       expect(userImportBuilder.buildRequest()).to.deep.equal(expectedRequest);
     });
   });
@@ -592,66 +752,70 @@ describe('UserImportBuilder', () => {
         algorithm,
       },
     };
+
     it('should return the expected response for successful import', () => {
-      const successfulServerResponse = [];
-      const successfulUserImportResponse = {
-        successCount: 3,
+      const successfulServerResponse: any = [];
+      const successfulUserImportResponse: UserImportResult = {
+        successCount: 4,
         failureCount: 0,
         errors: [],
       };
       const userImportBuilder =
           new UserImportBuilder(users, validOptions as any, userRequestValidator);
-      expect(userImportBuilder.buildResponse(successfulServerResponse))
-        .to.deep.equal(successfulUserImportResponse);
+      expectUserImportResult(
+        userImportBuilder.buildResponse(successfulServerResponse),
+        successfulUserImportResponse);
     });
 
     it('should return the expected response for import with server side errors', () => {
       const failingServerResponse = [
-        {index: 1, message: 'Some error occurred!'},
+        { index: 1, message: 'Some error occurred!' },
       ];
       const serverErrorUserImportResponse = {
-        successCount: 2,
+        successCount: 3,
         failureCount: 1,
         errors: [
           {
             // Index should match server error index.
             index: 1,
             error: new FirebaseAuthError(
-                AuthClientErrorCode.INVALID_USER_IMPORT,
-                'Some error occurred!',
+              AuthClientErrorCode.INVALID_USER_IMPORT,
+              'Some error occurred!',
             ),
           },
         ],
       };
       const userImportBuilder =
           new UserImportBuilder(users, validOptions as any, userRequestValidator);
-      expect(userImportBuilder.buildResponse(failingServerResponse))
-        .to.deep.equal(serverErrorUserImportResponse);
+      expectUserImportResult(
+        userImportBuilder.buildResponse(failingServerResponse),
+        serverErrorUserImportResponse);
     });
 
     it('should return the expected response for import with client side errors', () => {
-      const successfulServerResponse = [];
+      const successfulServerResponse: any = [];
       const clientErrorUserImportResponse = {
-        successCount: 2,
+        successCount: 3,
         failureCount: 1,
         errors: [
-          {index: 2, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PHONE_NUMBER)},
+          { index: 2, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PHONE_NUMBER) },
         ],
       };
       // userRequestValidatorWithError will throw on the 3rd user (index = 2).
       const userImportBuilder =
           new UserImportBuilder(users, validOptions as any, userRequestValidatorWithError);
-      expect(userImportBuilder.buildResponse(successfulServerResponse))
-        .to.deep.equal(clientErrorUserImportResponse);
+      expectUserImportResult(
+        userImportBuilder.buildResponse(successfulServerResponse),
+        clientErrorUserImportResponse);
     });
 
     it('should return the expected response for import with mixed client/server errors', () => {
       // Server errors will occur on USER3 and USER6 passed to backend.
       const failingServerResponse = [
-        {index: 1, message: 'Some error occurred in USER3!'},
-        {index: 3, message: 'Another error occurred in USER6!'},
+        { index: 1, message: 'Some error occurred in USER3!' },
+        { index: 3, message: 'Another error occurred in USER6!' },
       ];
-      const userRequestValidatorWithMultipleErrors = (request) => {
+      const userRequestValidatorWithMultipleErrors: ValidatorFunction = (request) => {
         // Simulate a validation error is thrown for specific users.
         if (request.localId === 'USER2') {
           throw new FirebaseAuthError(AuthClientErrorCode.INVALID_EMAIL);
@@ -662,56 +826,96 @@ describe('UserImportBuilder', () => {
 
       // The second and fourth users will throw a client side error.
       // The third and sixth user will throw a server side error.
-      // Seventh and eighth user will throw a client side error due to invalid type provided.
+      // Seventh, eighth and nineth user will throw a client side error due to invalid type provided.
+      // Tenth user will throw a client side error due to an unsupported second factor.
       const testUsers = [
-        {uid: 'USER1'},
-        {uid: 'USER2', email: 'invalid', passwordHash: Buffer.from('userpass')},
-        {uid: 'USER3'},
-        {uid: 'USER4', email: 'user@example.com', phoneNumber: 'invalid'},
-        {uid: 'USER5', email: 'johndoe@example.com', passwordHash: Buffer.from('password')},
-        {uid: 'USER6', phoneNumber: '+16505550101'},
-        {uid: 'USER7', email: 'other@domain.com', passwordHash: 'not a buffer' as any},
+        { uid: 'USER1' },
+        { uid: 'USER2', email: 'invalid', passwordHash: Buffer.from('userpass') },
+        { uid: 'USER3' },
+        { uid: 'USER4', email: 'user@example.com', phoneNumber: 'invalid' },
+        { uid: 'USER5', email: 'johndoe@example.com', passwordHash: Buffer.from('password') },
+        { uid: 'USER6', phoneNumber: '+16505550101' },
+        { uid: 'USER7', email: 'other@domain.com', passwordHash: 'not a buffer' as any },
         {
           uid: 'USER8',
           email: 'other@domain.com',
           passwordHash: Buffer.from('password'),
           passwordSalt: 'not a buffer' as any,
         },
+        {
+          uid: 'USER9',
+          multiFactor: {
+            enrolledFactors: [
+              {
+                uid: 'enrollmentId1',
+                phoneNumber: '+16505551111',
+                factorId: 'phone',
+                enrollmentTime: 'invalid',
+              },
+            ],
+          },
+        },
+        {
+          uid: 'USER10',
+          multiFactor: {
+            enrolledFactors: [
+              {
+                uid: 'enrollmentId2',
+                secret: 'SECRET',
+                displayName: 'Google Authenticator on personal phone',
+                factorId: 'totp',
+              } as any,
+            ],
+          },
+        },
       ];
       const mixedErrorUserImportResponse = {
         successCount: 2,
-        failureCount: 6,
+        failureCount: 8,
         errors: [
           // Client side detected error.
-          {index: 1, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_EMAIL)},
+          { index: 1, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_EMAIL) },
           // Server side detected error.
           {
             index: 2,
             error: new FirebaseAuthError(
-                AuthClientErrorCode.INVALID_USER_IMPORT,
-                'Some error occurred in USER3!',
+              AuthClientErrorCode.INVALID_USER_IMPORT,
+              'Some error occurred in USER3!',
             ),
           },
           // Client side detected error.
-          {index: 3, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PHONE_NUMBER)},
+          { index: 3, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PHONE_NUMBER) },
           // Server side detected error.
           {
             index: 5,
             error: new FirebaseAuthError(
-                AuthClientErrorCode.INVALID_USER_IMPORT,
-                'Another error occurred in USER6!',
+              AuthClientErrorCode.INVALID_USER_IMPORT,
+              'Another error occurred in USER6!',
             ),
           },
           // Client side errors.
-          {index: 6, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PASSWORD_HASH)},
-          {index: 7, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PASSWORD_SALT)},
+          { index: 6, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PASSWORD_HASH) },
+          { index: 7, error: new FirebaseAuthError(AuthClientErrorCode.INVALID_PASSWORD_SALT) },
+          {
+            index: 8,
+            error: new FirebaseAuthError(
+              AuthClientErrorCode.INVALID_ENROLLMENT_TIME,
+              'The second factor "enrollmentTime" for "enrollmentId1" must be a valid ' +
+              'UTC date string.'),
+          },
+          {
+            index: 9,
+            error: new FirebaseAuthError(
+              AuthClientErrorCode.UNSUPPORTED_SECOND_FACTOR,
+              `Unsupported second factor "${JSON.stringify(testUsers[9].multiFactor!.enrolledFactors[0])}" provided.`),
+          },
         ],
       };
       const userImportBuilder = new UserImportBuilder(
-          testUsers, validOptions as any, userRequestValidatorWithMultipleErrors);
-      expect(userImportBuilder.buildResponse(failingServerResponse))
-        .to.deep.equal(mixedErrorUserImportResponse);
+        testUsers, validOptions as any, userRequestValidatorWithMultipleErrors);
+      expectUserImportResult(
+        userImportBuilder.buildResponse(failingServerResponse),
+        mixedErrorUserImportResponse);
     });
   });
-
 });

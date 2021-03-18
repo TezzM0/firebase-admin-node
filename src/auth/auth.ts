@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,109 +15,79 @@
  * limitations under the License.
  */
 
-import {UserRecord, CreateRequest, UpdateRequest} from './user-record';
-import {FirebaseApp} from '../firebase-app';
-import {FirebaseTokenGenerator, cryptoSignerFromApp} from './token-generator';
-import {FirebaseAuthRequestHandler} from './auth-api-request';
-import {AuthClientErrorCode, FirebaseAuthError, ErrorInfo} from '../utils/error';
-import {FirebaseServiceInterface, FirebaseServiceInternalsInterface} from '../firebase-service';
+import { deepCopy } from '../utils/deep-copy';
+import { UserRecord } from './user-record';
 import {
-  UserImportOptions, UserImportRecord, UserImportResult,
-} from './user-import-builder';
-
+  isUidIdentifier, isEmailIdentifier, isPhoneIdentifier, isProviderIdentifier,
+} from './identifier';
+import { FirebaseApp } from '../firebase-app';
+import { FirebaseTokenGenerator, EmulatedSigner, cryptoSignerFromApp } from './token-generator';
+import {
+  AbstractAuthRequestHandler, AuthRequestHandler, TenantAwareAuthRequestHandler, useEmulator,
+} from './auth-api-request';
+import { AuthClientErrorCode, FirebaseAuthError, ErrorInfo } from '../utils/error';
 import * as utils from '../utils/index';
 import * as validator from '../utils/validator';
-import { FirebaseTokenVerifier, createSessionCookieVerifier, createIdTokenVerifier } from './token-verifier';
+import { auth } from './index';
+import {
+  FirebaseTokenVerifier, createSessionCookieVerifier, createIdTokenVerifier
+} from './token-verifier';
+import {
+  SAMLConfig, OIDCConfig, OIDCConfigServerResponse, SAMLConfigServerResponse,
+} from './auth-config';
+import { TenantManager } from './tenant-manager';
 
+import UserIdentifier = auth.UserIdentifier;
+import CreateRequest = auth.CreateRequest;
+import UpdateRequest = auth.UpdateRequest;
+import ActionCodeSettings = auth.ActionCodeSettings;
+import UserImportOptions = auth.UserImportOptions;
+import UserImportRecord = auth.UserImportRecord;
+import UserImportResult = auth.UserImportResult;
+import AuthProviderConfig = auth.AuthProviderConfig;
+import AuthProviderConfigFilter = auth.AuthProviderConfigFilter;
+import ListProviderConfigResults = auth.ListProviderConfigResults;
+import UpdateAuthProviderRequest = auth.UpdateAuthProviderRequest;
+import GetUsersResult = auth.GetUsersResult;
+import ListUsersResult = auth.ListUsersResult;
+import DeleteUsersResult = auth.DeleteUsersResult;
+import DecodedIdToken = auth.DecodedIdToken;
+import SessionCookieOptions = auth.SessionCookieOptions;
+import OIDCAuthProviderConfig = auth.OIDCAuthProviderConfig;
+import SAMLAuthProviderConfig = auth.SAMLAuthProviderConfig;
+import BaseAuthInterface = auth.BaseAuth;
+import AuthInterface = auth.Auth;
+import TenantAwareAuthInterface = auth.TenantAwareAuth;
 
 /**
- * Internals of an Auth instance.
+ * Base Auth class. Mainly used for user management APIs.
  */
-class AuthInternals implements FirebaseServiceInternalsInterface {
+export class BaseAuth<T extends AbstractAuthRequestHandler> implements BaseAuthInterface {
+
+  protected readonly tokenGenerator: FirebaseTokenGenerator;
+  protected readonly idTokenVerifier: FirebaseTokenVerifier;
+  protected readonly sessionCookieVerifier: FirebaseTokenVerifier;
+
   /**
-   * Deletes the service and its associated resources.
+   * The BaseAuth class constructor.
    *
-   * @return {Promise<()>} An empty Promise that will be fulfilled when the service is deleted.
-   */
-  public delete(): Promise<void> {
-    // There are no resources to clean up
-    return Promise.resolve(undefined);
-  }
-}
-
-
-/** Response object for a listUsers operation. */
-export interface ListUsersResult {
-  users: UserRecord[];
-  pageToken?: string;
-}
-
-
-/** Interface representing a decoded ID token. */
-export interface DecodedIdToken {
-  aud: string;
-  auth_time: number;
-  exp: number;
-  firebase: {
-    identities: {
-      [key: string]: any;
-    };
-    sign_in_provider: string;
-    [key: string]: any;
-  };
-  iat: number;
-  iss: string;
-  sub: string;
-  [key: string]: any;
-}
-
-
-/** Interface representing the session cookie options. */
-export interface SessionCookieOptions {
-  expiresIn: number;
-}
-
-
-/**
- * Auth service bound to the provided app.
- */
-export class Auth implements FirebaseServiceInterface {
-  public INTERNAL: AuthInternals = new AuthInternals();
-
-  private readonly app_: FirebaseApp;
-  private readonly tokenGenerator: FirebaseTokenGenerator;
-  private readonly idTokenVerifier: FirebaseTokenVerifier;
-  private readonly sessionCookieVerifier: FirebaseTokenVerifier;
-  private readonly authRequestHandler: FirebaseAuthRequestHandler;
-
-  /**
-   * @param {object} app The app for this Auth service.
+   * @param app The FirebaseApp to associate with this Auth instance.
+   * @param authRequestHandler The RPC request handler for this instance.
+   * @param tokenGenerator Optional token generator. If not specified, a
+   *     (non-tenant-aware) instance will be created. Use this paramter to
+   *     specify a tenant-aware tokenGenerator.
    * @constructor
    */
-  constructor(app: FirebaseApp) {
-    if (typeof app !== 'object' || app === null || !('options' in app)) {
-      throw new FirebaseAuthError(
-        AuthClientErrorCode.INVALID_ARGUMENT,
-        'First argument passed to admin.auth() must be a valid Firebase app instance.',
-      );
+  constructor(app: FirebaseApp, protected readonly authRequestHandler: T, tokenGenerator?: FirebaseTokenGenerator) {
+    if (tokenGenerator) {
+      this.tokenGenerator = tokenGenerator;
+    } else {
+      const cryptoSigner = useEmulator() ? new EmulatedSigner() : cryptoSignerFromApp(app);
+      this.tokenGenerator = new FirebaseTokenGenerator(cryptoSigner);
     }
 
-    this.app_ = app;
-    this.tokenGenerator = new FirebaseTokenGenerator(cryptoSignerFromApp(app));
-    const projectId = utils.getProjectId(app);
-    this.sessionCookieVerifier = createSessionCookieVerifier(projectId);
-    this.idTokenVerifier = createIdTokenVerifier(projectId);
-    // Initialize auth request handler with the app.
-    this.authRequestHandler = new FirebaseAuthRequestHandler(app);
-  }
-
-  /**
-   * Returns the app associated with this Auth instance.
-   *
-   * @return {FirebaseApp} The app associated with this Auth instance.
-   */
-  get app(): FirebaseApp {
-    return this.app_;
+    this.sessionCookieVerifier = createSessionCookieVerifier(app);
+    this.idTokenVerifier = createIdTokenVerifier(app);
   }
 
   /**
@@ -144,16 +115,17 @@ export class Auth implements FirebaseServiceInterface {
    * @return {Promise<DecodedIdToken>} A Promise that will be fulfilled after a successful
    *     verification.
    */
-  public verifyIdToken(idToken: string, checkRevoked: boolean = false): Promise<object> {
-    return this.idTokenVerifier.verifyJWT(idToken)
+  public verifyIdToken(idToken: string, checkRevoked = false): Promise<DecodedIdToken> {
+    const isEmulator = useEmulator();
+    return this.idTokenVerifier.verifyJWT(idToken, isEmulator)
       .then((decodedIdToken: DecodedIdToken) => {
         // Whether to check if the token was revoked.
-        if (!checkRevoked) {
-          return decodedIdToken;
+        if (checkRevoked || isEmulator) {
+          return this.verifyDecodedJWTNotRevoked(
+            decodedIdToken,
+            AuthClientErrorCode.ID_TOKEN_REVOKED);
         }
-        return this.verifyDecodedJWTNotRevoked(
-          decodedIdToken,
-          AuthClientErrorCode.ID_TOKEN_REVOKED);
+        return decodedIdToken;
       });
   }
 
@@ -203,6 +175,91 @@ export class Auth implements FirebaseServiceInterface {
   }
 
   /**
+   * Gets the user data for the user corresponding to a given provider id.
+   *
+   * See [Retrieve user data](/docs/auth/admin/manage-users#retrieve_user_data)
+   * for code samples and detailed documentation.
+   *
+   * @param providerId The provider ID, for example, "google.com" for the
+   *   Google provider.
+   * @param uid The user identifier for the given provider.
+   *
+   * @return A promise fulfilled with the user data corresponding to the
+   *   given provider id.
+   */
+  public getUserByProviderUid(providerId: string, uid: string): Promise<UserRecord> {
+    // Although we don't really advertise it, we want to also handle
+    // non-federated idps with this call. So if we detect one of them, we'll
+    // reroute this request appropriately.
+    if (providerId === 'phone') {
+      return this.getUserByPhoneNumber(uid);
+    } else if (providerId === 'email') {
+      return this.getUserByEmail(uid);
+    }
+
+    return this.authRequestHandler.getAccountInfoByFederatedUid(providerId, uid)
+      .then((response: any) => {
+        // Returns the user record populated with server response.
+        return new UserRecord(response.users[0]);
+      });
+  }
+
+  /**
+   * Gets the user data corresponding to the specified identifiers.
+   *
+   * There are no ordering guarantees; in particular, the nth entry in the result list is not
+   * guaranteed to correspond to the nth entry in the input parameters list.
+   *
+   * Only a maximum of 100 identifiers may be supplied. If more than 100 identifiers are supplied,
+   * this method will immediately throw a FirebaseAuthError.
+   *
+   * @param identifiers The identifiers used to indicate which user records should be returned. Must
+   *     have <= 100 entries.
+   * @return {Promise<GetUsersResult>} A promise that resolves to the corresponding user records.
+   * @throws FirebaseAuthError If any of the identifiers are invalid or if more than 100
+   *     identifiers are specified.
+   */
+  public getUsers(identifiers: UserIdentifier[]): Promise<GetUsersResult> {
+    if (!validator.isArray(identifiers)) {
+      throw new FirebaseAuthError(
+        AuthClientErrorCode.INVALID_ARGUMENT, '`identifiers` parameter must be an array');
+    }
+    return this.authRequestHandler
+      .getAccountInfoByIdentifiers(identifiers)
+      .then((response: any) => {
+        /**
+         * Checks if the specified identifier is within the list of
+         * UserRecords.
+         */
+        const isUserFound = ((id: UserIdentifier, userRecords: UserRecord[]): boolean => {
+          return !!userRecords.find((userRecord) => {
+            if (isUidIdentifier(id)) {
+              return id.uid === userRecord.uid;
+            } else if (isEmailIdentifier(id)) {
+              return id.email === userRecord.email;
+            } else if (isPhoneIdentifier(id)) {
+              return id.phoneNumber === userRecord.phoneNumber;
+            } else if (isProviderIdentifier(id)) {
+              const matchingUserInfo = userRecord.providerData.find((userInfo) => {
+                return id.providerId === userInfo.providerId;
+              });
+              return !!matchingUserInfo && id.providerUid === matchingUserInfo.uid;
+            } else {
+              throw new FirebaseAuthError(
+                AuthClientErrorCode.INTERNAL_ERROR,
+                'Unhandled identifier type');
+            }
+          });
+        });
+
+        const users = response.users ? response.users.map((user: any) => new UserRecord(user)) : [];
+        const notFound = identifiers.filter((id) => !isUserFound(id, users));
+
+        return { users, notFound };
+      });
+  }
+
+  /**
    * Exports a batch of user accounts. Batch size is determined by the maxResults argument.
    * Starting point of the batch is determined by the pageToken argument.
    *
@@ -220,7 +277,7 @@ export class Auth implements FirebaseServiceInterface {
         // List of users to return.
         const users: UserRecord[] = [];
         // Convert each user response to a UserRecord.
-        response.users.forEach((userResponse) => {
+        response.users.forEach((userResponse: any) => {
           users.push(new UserRecord(userResponse));
         });
         // Return list of user records and the next page token if available.
@@ -268,8 +325,52 @@ export class Auth implements FirebaseServiceInterface {
    */
   public deleteUser(uid: string): Promise<void> {
     return this.authRequestHandler.deleteAccount(uid)
-      .then((response) => {
+      .then(() => {
         // Return nothing on success.
+      });
+  }
+
+  public deleteUsers(uids: string[]): Promise<DeleteUsersResult> {
+    if (!validator.isArray(uids)) {
+      throw new FirebaseAuthError(
+        AuthClientErrorCode.INVALID_ARGUMENT, '`uids` parameter must be an array');
+    }
+    return this.authRequestHandler.deleteAccounts(uids, /*force=*/true)
+      .then((batchDeleteAccountsResponse) => {
+        const result: DeleteUsersResult = {
+          failureCount: 0,
+          successCount: uids.length,
+          errors: [],
+        };
+
+        if (!validator.isNonEmptyArray(batchDeleteAccountsResponse.errors)) {
+          return result;
+        }
+
+        result.failureCount = batchDeleteAccountsResponse.errors.length;
+        result.successCount = uids.length - batchDeleteAccountsResponse.errors.length;
+        result.errors = batchDeleteAccountsResponse.errors.map((batchDeleteErrorInfo) => {
+          if (batchDeleteErrorInfo.index === undefined) {
+            throw new FirebaseAuthError(
+              AuthClientErrorCode.INTERNAL_ERROR,
+              'Corrupt BatchDeleteAccountsResponse detected');
+          }
+
+          const errMsgToError = (msg?: string): FirebaseAuthError => {
+            // We unconditionally set force=true, so the 'NOT_DISABLED' error
+            // should not be possible.
+            const code = msg && msg.startsWith('NOT_DISABLED') ?
+              AuthClientErrorCode.USER_NOT_DISABLED : AuthClientErrorCode.INTERNAL_ERROR;
+            return new FirebaseAuthError(code, batchDeleteErrorInfo.message);
+          };
+
+          return {
+            index: batchDeleteErrorInfo.index,
+            error: errMsgToError(batchDeleteErrorInfo.message),
+          };
+        });
+
+        return result;
       });
   }
 
@@ -281,6 +382,50 @@ export class Auth implements FirebaseServiceInterface {
    * @return {Promise<UserRecord>} A promise that resolves with the modified user record.
    */
   public updateUser(uid: string, properties: UpdateRequest): Promise<UserRecord> {
+    // Although we don't really advertise it, we want to also handle linking of
+    // non-federated idps with this call. So if we detect one of them, we'll
+    // adjust the properties parameter appropriately. This *does* imply that a
+    // conflict could arise, e.g. if the user provides a phoneNumber property,
+    // but also provides a providerToLink with a 'phone' provider id. In that
+    // case, we'll throw an error.
+    properties = deepCopy(properties);
+
+    if (properties?.providerToLink) {
+      if (properties.providerToLink.providerId === 'email') {
+        if (typeof properties.email !== 'undefined') {
+          throw new FirebaseAuthError(
+            AuthClientErrorCode.INVALID_ARGUMENT,
+            "Both UpdateRequest.email and UpdateRequest.providerToLink.providerId='email' were set. To "
+            + 'link to the email/password provider, only specify the UpdateRequest.email field.');
+        }
+        properties.email = properties.providerToLink.uid;
+        delete properties.providerToLink;
+      } else if (properties.providerToLink.providerId === 'phone') {
+        if (typeof properties.phoneNumber !== 'undefined') {
+          throw new FirebaseAuthError(
+            AuthClientErrorCode.INVALID_ARGUMENT,
+            "Both UpdateRequest.phoneNumber and UpdateRequest.providerToLink.providerId='phone' were set. To "
+            + 'link to a phone provider, only specify the UpdateRequest.phoneNumber field.');
+        }
+        properties.phoneNumber = properties.providerToLink.uid;
+        delete properties.providerToLink;
+      }
+    }
+    if (properties?.providersToUnlink) {
+      if (properties.providersToUnlink.indexOf('phone') !== -1) {
+        // If we've been told to unlink the phone provider both via setting
+        // phoneNumber to null *and* by setting providersToUnlink to include
+        // 'phone', then we'll reject that. Though it might also be reasonable
+        // to relax this restriction and just unlink it.
+        if (properties.phoneNumber === null) {
+          throw new FirebaseAuthError(
+            AuthClientErrorCode.INVALID_ARGUMENT,
+            "Both UpdateRequest.phoneNumber=null and UpdateRequest.providersToUnlink=['phone'] were set. To "
+            + 'unlink from a phone provider, only specify the UpdateRequest.phoneNumber=null field.');
+        }
+      }
+    }
+
     return this.authRequestHandler.updateExistingAccount(uid, properties)
       .then((existingUid) => {
         // Return the corresponding user record.
@@ -296,9 +441,9 @@ export class Auth implements FirebaseServiceInterface {
    * @return {Promise<void>} A promise that resolves when the operation completes
    *     successfully.
    */
-  public setCustomUserClaims(uid: string, customUserClaims: object): Promise<void> {
+  public setCustomUserClaims(uid: string, customUserClaims: object | null): Promise<void> {
     return this.authRequestHandler.setCustomUserClaims(uid, customUserClaims)
-      .then((existingUid) => {
+      .then(() => {
         // Return nothing on success.
       });
   }
@@ -315,7 +460,7 @@ export class Auth implements FirebaseServiceInterface {
    */
   public revokeRefreshTokens(uid: string): Promise<void> {
     return this.authRequestHandler.revokeRefreshTokens(uid)
-      .then((existingUid) => {
+      .then(() => {
         // Return nothing on success.
       });
   }
@@ -334,7 +479,7 @@ export class Auth implements FirebaseServiceInterface {
    *     of failed uploads and their corresponding errors.
    */
   public importUsers(
-      users: UserImportRecord[], options?: UserImportOptions): Promise<UserImportResult> {
+    users: UserImportRecord[], options?: UserImportOptions): Promise<UserImportResult> {
     return this.authRequestHandler.uploadAccount(users, options);
   }
 
@@ -350,7 +495,7 @@ export class Auth implements FirebaseServiceInterface {
    * @return {Promise<string>} A promise that resolves on success with the created session cookie.
    */
   public createSessionCookie(
-      idToken: string, sessionCookieOptions: SessionCookieOptions): Promise<string> {
+    idToken: string, sessionCookieOptions: SessionCookieOptions): Promise<string> {
     // Return rejected promise if expiresIn is not available.
     if (!validator.isNonNullObject(sessionCookieOptions) ||
         !validator.isNumber(sessionCookieOptions.expiresIn)) {
@@ -373,17 +518,208 @@ export class Auth implements FirebaseServiceInterface {
    *     verification.
    */
   public verifySessionCookie(
-      sessionCookie: string, checkRevoked: boolean = false): Promise<DecodedIdToken> {
-    return this.sessionCookieVerifier.verifyJWT(sessionCookie)
+    sessionCookie: string, checkRevoked = false): Promise<DecodedIdToken> {
+    const isEmulator = useEmulator();
+    return this.sessionCookieVerifier.verifyJWT(sessionCookie, isEmulator)
       .then((decodedIdToken: DecodedIdToken) => {
         // Whether to check if the token was revoked.
-        if (!checkRevoked) {
-          return decodedIdToken;
+        if (checkRevoked || isEmulator) {
+          return this.verifyDecodedJWTNotRevoked(
+            decodedIdToken,
+            AuthClientErrorCode.SESSION_COOKIE_REVOKED);
         }
-        return this.verifyDecodedJWTNotRevoked(
-          decodedIdToken,
-          AuthClientErrorCode.SESSION_COOKIE_REVOKED);
+        return decodedIdToken;
       });
+  }
+
+  /**
+   * Generates the out of band email action link for password reset flows for the
+   * email specified using the action code settings provided.
+   * Returns a promise that resolves with the generated link.
+   *
+   * @param {string} email The email of the user whose password is to be reset.
+   * @param {ActionCodeSettings=} actionCodeSettings The optional action code setings which defines whether
+   *     the link is to be handled by a mobile app and the additional state information to be passed in the
+   *     deep link, etc.
+   * @return {Promise<string>} A promise that resolves with the password reset link.
+   */
+  public generatePasswordResetLink(email: string, actionCodeSettings?: ActionCodeSettings): Promise<string> {
+    return this.authRequestHandler.getEmailActionLink('PASSWORD_RESET', email, actionCodeSettings);
+  }
+
+  /**
+   * Generates the out of band email action link for email verification flows for the
+   * email specified using the action code settings provided.
+   * Returns a promise that resolves with the generated link.
+   *
+   * @param {string} email The email of the user to be verified.
+   * @param {ActionCodeSettings=} actionCodeSettings The optional action code setings which defines whether
+   *     the link is to be handled by a mobile app and the additional state information to be passed in the
+   *     deep link, etc.
+   * @return {Promise<string>} A promise that resolves with the email verification link.
+   */
+  public generateEmailVerificationLink(email: string, actionCodeSettings?: ActionCodeSettings): Promise<string> {
+    return this.authRequestHandler.getEmailActionLink('VERIFY_EMAIL', email, actionCodeSettings);
+  }
+
+  /**
+   * Generates the out of band email action link for email link sign-in flows for the
+   * email specified using the action code settings provided.
+   * Returns a promise that resolves with the generated link.
+   *
+   * @param {string} email The email of the user signing in.
+   * @param {ActionCodeSettings} actionCodeSettings The required action code setings which defines whether
+   *     the link is to be handled by a mobile app and the additional state information to be passed in the
+   *     deep link, etc.
+   * @return {Promise<string>} A promise that resolves with the email sign-in link.
+   */
+  public generateSignInWithEmailLink(email: string, actionCodeSettings: ActionCodeSettings): Promise<string> {
+    return this.authRequestHandler.getEmailActionLink('EMAIL_SIGNIN', email, actionCodeSettings);
+  }
+
+  /**
+   * Returns the list of existing provider configuation matching the filter provided.
+   * At most, 100 provider configs are allowed to be imported at a time.
+   *
+   * @param {AuthProviderConfigFilter} options The provider config filter to apply.
+   * @return {Promise<ListProviderConfigResults>} A promise that resolves with the list of provider configs
+   *     meeting the filter requirements.
+   */
+  public listProviderConfigs(options: AuthProviderConfigFilter): Promise<ListProviderConfigResults> {
+    const processResponse = (response: any, providerConfigs: AuthProviderConfig[]): ListProviderConfigResults => {
+      // Return list of provider configuration and the next page token if available.
+      const result: ListProviderConfigResults = {
+        providerConfigs,
+      };
+      // Delete result.pageToken if undefined.
+      if (Object.prototype.hasOwnProperty.call(response, 'nextPageToken')) {
+        result.pageToken = response.nextPageToken;
+      }
+      return result;
+    };
+    if (options && options.type === 'oidc') {
+      return this.authRequestHandler.listOAuthIdpConfigs(options.maxResults, options.pageToken)
+        .then((response: any) => {
+          // List of provider configurations to return.
+          const providerConfigs: OIDCConfig[] = [];
+          // Convert each provider config response to a OIDCConfig.
+          response.oauthIdpConfigs.forEach((configResponse: any) => {
+            providerConfigs.push(new OIDCConfig(configResponse));
+          });
+          // Return list of provider configuration and the next page token if available.
+          return processResponse(response, providerConfigs);
+        });
+    } else if (options && options.type === 'saml') {
+      return this.authRequestHandler.listInboundSamlConfigs(options.maxResults, options.pageToken)
+        .then((response: any) => {
+          // List of provider configurations to return.
+          const providerConfigs: SAMLConfig[] = [];
+          // Convert each provider config response to a SAMLConfig.
+          response.inboundSamlConfigs.forEach((configResponse: any) => {
+            providerConfigs.push(new SAMLConfig(configResponse));
+          });
+          // Return list of provider configuration and the next page token if available.
+          return processResponse(response, providerConfigs);
+        });
+    }
+    return Promise.reject(
+      new FirebaseAuthError(
+        AuthClientErrorCode.INVALID_ARGUMENT,
+        '"AuthProviderConfigFilter.type" must be either "saml" or "oidc"'));
+  }
+
+  /**
+   * Looks up an Auth provider configuration by ID.
+   * Returns a promise that resolves with the provider configuration corresponding to the provider ID specified.
+   *
+   * @param {string} providerId  The provider ID corresponding to the provider config to return.
+   * @return {Promise<AuthProviderConfig>}
+   */
+  public getProviderConfig(providerId: string): Promise<AuthProviderConfig> {
+    if (OIDCConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.getOAuthIdpConfig(providerId)
+        .then((response: OIDCConfigServerResponse) => {
+          return new OIDCConfig(response);
+        });
+    } else if (SAMLConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.getInboundSamlConfig(providerId)
+        .then((response: SAMLConfigServerResponse) => {
+          return new SAMLConfig(response);
+        });
+    }
+    return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_PROVIDER_ID));
+  }
+
+  /**
+   * Deletes the provider configuration corresponding to the provider ID passed.
+   *
+   * @param {string} providerId The provider ID corresponding to the provider config to delete.
+   * @return {Promise<void>} A promise that resolves on completion.
+   */
+  public deleteProviderConfig(providerId: string): Promise<void> {
+    if (OIDCConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.deleteOAuthIdpConfig(providerId);
+    } else if (SAMLConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.deleteInboundSamlConfig(providerId);
+    }
+    return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_PROVIDER_ID));
+  }
+
+  /**
+   * Returns a promise that resolves with the updated AuthProviderConfig when the provider configuration corresponding
+   * to the provider ID specified is updated with the specified configuration.
+   *
+   * @param {string} providerId The provider ID corresponding to the provider config to update.
+   * @param {UpdateAuthProviderRequest} updatedConfig The updated configuration.
+   * @return {Promise<AuthProviderConfig>} A promise that resolves with the updated provider configuration.
+   */
+  public updateProviderConfig(
+    providerId: string, updatedConfig: UpdateAuthProviderRequest): Promise<AuthProviderConfig> {
+    if (!validator.isNonNullObject(updatedConfig)) {
+      return Promise.reject(new FirebaseAuthError(
+        AuthClientErrorCode.INVALID_CONFIG,
+        'Request is missing "UpdateAuthProviderRequest" configuration.',
+      ));
+    }
+    if (OIDCConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.updateOAuthIdpConfig(providerId, updatedConfig)
+        .then((response) => {
+          return new OIDCConfig(response);
+        });
+    } else if (SAMLConfig.isProviderId(providerId)) {
+      return this.authRequestHandler.updateInboundSamlConfig(providerId, updatedConfig)
+        .then((response) => {
+          return new SAMLConfig(response);
+        });
+    }
+    return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_PROVIDER_ID));
+  }
+
+  /**
+   * Returns a promise that resolves with the newly created AuthProviderConfig when the new provider configuration is
+   * created.
+   * @param {AuthProviderConfig} config The provider configuration to create.
+   * @return {Promise<AuthProviderConfig>} A promise that resolves with the created provider configuration.
+   */
+  public createProviderConfig(config: AuthProviderConfig): Promise<AuthProviderConfig> {
+    if (!validator.isNonNullObject(config)) {
+      return Promise.reject(new FirebaseAuthError(
+        AuthClientErrorCode.INVALID_CONFIG,
+        'Request is missing "AuthProviderConfig" configuration.',
+      ));
+    }
+    if (OIDCConfig.isProviderId(config.providerId)) {
+      return this.authRequestHandler.createOAuthIdpConfig(config as OIDCAuthProviderConfig)
+        .then((response) => {
+          return new OIDCConfig(response);
+        });
+    } else if (SAMLConfig.isProviderId(config.providerId)) {
+      return this.authRequestHandler.createInboundSamlConfig(config as SAMLAuthProviderConfig)
+        .then((response) => {
+          return new SAMLConfig(response);
+        });
+    }
+    return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_PROVIDER_ID));
   }
 
   /**
@@ -397,7 +733,7 @@ export class Auth implements FirebaseServiceInterface {
    *     verification.
    */
   private verifyDecodedJWTNotRevoked(
-      decodedIdToken: DecodedIdToken, revocationErrorInfo: ErrorInfo): Promise<DecodedIdToken> {
+    decodedIdToken: DecodedIdToken, revocationErrorInfo: ErrorInfo): Promise<DecodedIdToken> {
     // Get tokens valid after time for the corresponding user.
     return this.getUser(decodedIdToken.sub)
       .then((user: UserRecord) => {
@@ -415,5 +751,139 @@ export class Auth implements FirebaseServiceInterface {
         // All checks above passed. Return the decoded token.
         return decodedIdToken;
       });
+  }
+}
+
+
+/**
+ * The tenant aware Auth class.
+ */
+export class TenantAwareAuth
+  extends BaseAuth<TenantAwareAuthRequestHandler>
+  implements TenantAwareAuthInterface {
+
+  public readonly tenantId: string;
+
+  /**
+   * The TenantAwareAuth class constructor.
+   *
+   * @param {object} app The app that created this tenant.
+   * @param tenantId The corresponding tenant ID.
+   * @constructor
+   */
+  constructor(app: FirebaseApp, tenantId: string) {
+    const cryptoSigner = useEmulator() ? new EmulatedSigner() : cryptoSignerFromApp(app);
+    const tokenGenerator = new FirebaseTokenGenerator(cryptoSigner, tenantId);
+    super(app, new TenantAwareAuthRequestHandler(app, tenantId), tokenGenerator);
+    utils.addReadonlyGetter(this, 'tenantId', tenantId);
+  }
+
+  /**
+   * Verifies a JWT auth token. Returns a Promise with the tokens claims. Rejects
+   * the promise if the token could not be verified. If checkRevoked is set to true,
+   * verifies if the session corresponding to the ID token was revoked. If the corresponding
+   * user's session was invalidated, an auth/id-token-revoked error is thrown. If not specified
+   * the check is not applied.
+   *
+   * @param {string} idToken The JWT to verify.
+   * @param {boolean=} checkRevoked Whether to check if the ID token is revoked.
+   * @return {Promise<DecodedIdToken>} A Promise that will be fulfilled after a successful
+   *     verification.
+   */
+  public verifyIdToken(idToken: string, checkRevoked = false): Promise<DecodedIdToken> {
+    return super.verifyIdToken(idToken, checkRevoked)
+      .then((decodedClaims) => {
+        // Validate tenant ID.
+        if (decodedClaims.firebase.tenant !== this.tenantId) {
+          throw new FirebaseAuthError(AuthClientErrorCode.MISMATCHING_TENANT_ID);
+        }
+        return decodedClaims;
+      });
+  }
+
+  /**
+   * Creates a new Firebase session cookie with the specified options that can be used for
+   * session management (set as a server side session cookie with custom cookie policy).
+   * The session cookie JWT will have the same payload claims as the provided ID token.
+   *
+   * @param {string} idToken The Firebase ID token to exchange for a session cookie.
+   * @param {SessionCookieOptions} sessionCookieOptions The session cookie options which includes
+   *     custom session duration.
+   *
+   * @return {Promise<string>} A promise that resolves on success with the created session cookie.
+   */
+  public createSessionCookie(
+    idToken: string, sessionCookieOptions: SessionCookieOptions): Promise<string> {
+    // Validate arguments before processing.
+    if (!validator.isNonEmptyString(idToken)) {
+      return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_ID_TOKEN));
+    }
+    if (!validator.isNonNullObject(sessionCookieOptions) ||
+        !validator.isNumber(sessionCookieOptions.expiresIn)) {
+      return Promise.reject(new FirebaseAuthError(AuthClientErrorCode.INVALID_SESSION_COOKIE_DURATION));
+    }
+    // This will verify the ID token and then match the tenant ID before creating the session cookie.
+    return this.verifyIdToken(idToken)
+      .then(() => {
+        return super.createSessionCookie(idToken, sessionCookieOptions);
+      });
+  }
+
+  /**
+   * Verifies a Firebase session cookie. Returns a Promise with the tokens claims. Rejects
+   * the promise if the token could not be verified. If checkRevoked is set to true,
+   * verifies if the session corresponding to the session cookie was revoked. If the corresponding
+   * user's session was invalidated, an auth/session-cookie-revoked error is thrown. If not
+   * specified the check is not performed.
+   *
+   * @param {string} sessionCookie The session cookie to verify.
+   * @param {boolean=} checkRevoked Whether to check if the session cookie is revoked.
+   * @return {Promise<DecodedIdToken>} A Promise that will be fulfilled after a successful
+   *     verification.
+   */
+  public verifySessionCookie(
+    sessionCookie: string, checkRevoked = false): Promise<DecodedIdToken> {
+    return super.verifySessionCookie(sessionCookie, checkRevoked)
+      .then((decodedClaims) => {
+        if (decodedClaims.firebase.tenant !== this.tenantId) {
+          throw new FirebaseAuthError(AuthClientErrorCode.MISMATCHING_TENANT_ID);
+        }
+        return decodedClaims;
+      });
+  }
+}
+
+
+/**
+ * Auth service bound to the provided app.
+ * An Auth instance can have multiple tenants.
+ */
+export class Auth extends BaseAuth<AuthRequestHandler> implements AuthInterface {
+
+  private readonly tenantManager_: TenantManager;
+  private readonly app_: FirebaseApp;
+
+  /**
+   * @param {object} app The app for this Auth service.
+   * @constructor
+   */
+  constructor(app: FirebaseApp) {
+    super(app, new AuthRequestHandler(app));
+    this.app_ = app;
+    this.tenantManager_ = new TenantManager(app);
+  }
+
+  /**
+   * Returns the app associated with this Auth instance.
+   *
+   * @return {FirebaseApp} The app associated with this Auth instance.
+   */
+  get app(): FirebaseApp {
+    return this.app_;
+  }
+
+  /** @return The current Auth instance's tenant manager. */
+  public tenantManager(): TenantManager {
+    return this.tenantManager_;
   }
 }

@@ -17,13 +17,10 @@
 import * as admin from '../../lib/index';
 import * as chai from 'chai';
 import * as chaiAsPromised from 'chai-as-promised';
-import url = require('url');
-import {defaultApp, nullApp, nonNullApp, cmdArgs, databaseUrl} from './setup';
+import { defaultApp, nullApp, nonNullApp, cmdArgs, databaseUrl } from './setup';
 
-/* tslint:disable:no-var-requires */
-const apiRequest = require('../../lib/utils/api-request');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const chalk = require('chalk');
-/* tslint:enable:no-var-requires */
 
 chai.should();
 chai.use(chaiAsPromised);
@@ -43,19 +40,13 @@ describe('admin.database', () => {
     }
     console.log(chalk.yellow('    Updating security rules to defaults.'));
     /* tslint:enable:no-console */
-    const client = new apiRequest.SignedApiRequestHandler(defaultApp);
-    const dbUrl =  url.parse(databaseUrl);
     const defaultRules = {
       rules : {
         '.read': 'auth != null',
         '.write': 'auth != null',
       },
     };
-    const headers = {
-      'Content-Type': 'application/json',
-    };
-    return client.sendRequest(dbUrl.host, 443, '/.settings/rules.json',
-      'PUT', defaultRules, headers, 10000);
+    return admin.database().setRules(defaultRules);
   });
 
   it('admin.database() returns a database client', () => {
@@ -165,13 +156,26 @@ describe('admin.database', () => {
       return refWithUrl.remove().should.eventually.be.fulfilled;
     });
   });
+
+  it('admin.database().getRules() returns currently defined rules as a string', () => {
+    return admin.database().getRules().then((result) => {
+      return expect(result).to.be.not.empty;
+    });
+  });
+
+  it('admin.database().getRulesJSON() returns currently defined rules as an object', () => {
+    return admin.database().getRulesJSON().then((result) => {
+      return expect(result).to.be.not.undefined;
+    });
+  });
 });
 
-function addValueEventListener(
-    db: admin.database.Database,
-    callback: (s: admin.database.DataSnapshot) => any) {
-  // Check for type compilation. This method is not invoked by any tests. But it will
-  // trigger a TS compilation failure if the RTDB typings were not loaded correctly.
+// Check for type compilation. This method is not invoked by any tests. But it
+// will trigger a TS compilation failure if the RTDB typings were not loaded
+// correctly. (Marked as export to avoid compilation warning.)
+export function addValueEventListener(
+  db: admin.database.Database,
+  callback: (s: admin.database.DataSnapshot | null) => any): void {
   const eventType: admin.database.EventType = 'value';
   db.ref().on(eventType, callback);
 }

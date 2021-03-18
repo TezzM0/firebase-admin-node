@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,51 +16,24 @@
  */
 
 import * as _ from 'lodash';
-import * as nock from 'nock';
+import * as sinon from 'sinon';
 
 import * as mocks from '../resources/mocks';
 
-import {FirebaseNamespace} from '../../src/firebase-namespace';
-import {FirebaseApp, FirebaseAppOptions} from '../../src/firebase-app';
+import { FirebaseNamespace } from '../../src/firebase-namespace';
+import { AppOptions } from '../../src/firebase-namespace-api';
+import { FirebaseApp, FirebaseAppInternals, FirebaseAccessToken } from '../../src/firebase-app';
 import { HttpError, HttpResponse } from '../../src/utils/api-request';
 
 /**
  * Returns a new FirebaseApp instance with the provided options.
  *
- * @param {object} options The options for the FirebaseApp instance to create.
- * @return {FirebaseApp} A new FirebaseApp instance with the provided options.
+ * @param options The options for the FirebaseApp instance to create.
+ * @return A new FirebaseApp instance with the provided options.
  */
-export function createAppWithOptions(options: object) {
+export function createAppWithOptions(options: object): FirebaseApp {
   const mockFirebaseNamespaceInternals = new FirebaseNamespace().INTERNAL;
-  return new FirebaseApp(options as FirebaseAppOptions, mocks.appName, mockFirebaseNamespaceInternals);
-}
-
-
-/**
- * Returns a mocked out success response from the URL generating Google access tokens given a JWT
- * signed with a service account private key.
- *
- * Calling this once will mock ALL future requests to this endpoint. Use nock.cleanAll() to unmock.
- *
- * @param {string} [token] The optional access token to return. If not specified, a random one
- *     is created.
- * @param {number} [expiresIn] The optional expires in value to use for the access token.
- * @return {Object} A nock response object.
- */
-export function mockFetchAccessTokenRequests(
-  token: string = generateRandomAccessToken(),
-  expiresIn: number = 60 * 60,
-): nock.Scope {
-  return nock('https://accounts.google.com:443')
-    .persist()
-    .post('/o/oauth2/token')
-    .reply(200, {
-      access_token: token,
-      token_type: 'Bearer',
-      expires_in: expiresIn,
-    }, {
-      'cache-control': 'no-cache, no-store, max-age=0, must-revalidate',
-    });
+  return new FirebaseApp(options as AppOptions, mocks.appName, mockFirebaseNamespaceInternals);
 }
 
 
@@ -69,14 +43,37 @@ export function generateRandomAccessToken(): string {
 }
 
 /**
+ * Creates a stub for retrieving an access token from a FirebaseApp. All services should use this
+ * method for stubbing the OAuth2 flow during unit tests.
+ *
+ * @param {string} accessToken The access token string to return.
+ * @param {FirebaseApp} app The app instance to stub. If not specified, the stub will affect all apps.
+ * @return {sinon.SinonStub} A Sinon stub.
+ */
+export function stubGetAccessToken(accessToken?: string, app?: FirebaseApp): sinon.SinonStub {
+  if (typeof accessToken === 'undefined') {
+    accessToken = generateRandomAccessToken();
+  }
+  const result: FirebaseAccessToken = {
+    accessToken,
+    expirationTime: Date.now() + 3600,
+  };
+  if (app) {
+    return sinon.stub(app.INTERNAL, 'getToken').resolves(result);
+  } else {
+    return sinon.stub(FirebaseAppInternals.prototype, 'getToken').resolves(result);
+  }
+}
+
+/**
  * Creates a mock HTTP response from the given data and parameters.
  *
  * @param {object | string} data Data to be included in the response body.
  * @param {number=} status HTTP status code (defaults to 200).
  * @param {*=} headers HTTP headers to be included in the ersponse.
- * @returns {HttpResponse} An HTTP response object.
+ * @return {HttpResponse} An HTTP response object.
  */
-export function responseFrom(data: object | string, status: number = 200, headers: any = {}): HttpResponse {
+export function responseFrom(data: object | string, status = 200, headers: any = {}): HttpResponse {
   let responseData: any;
   let responseText: string;
   if (typeof data === 'object') {
@@ -95,9 +92,10 @@ export function responseFrom(data: object | string, status: number = 200, header
     headers,
     data: responseData,
     text: responseText,
+    isJson: () => responseData != null,
   };
 }
 
-export function errorFrom(data: any, status: number = 500): HttpError {
+export function errorFrom(data: any, status = 500): HttpError {
   return new HttpError(responseFrom(data, status));
 }

@@ -1,4 +1,5 @@
 /*!
+ * @license
  * Copyright 2017 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +17,8 @@
 
 'use strict';
 
-// Use untyped import syntax for Node built-ins
-import https = require('https');
-
 import * as _ from 'lodash';
 import * as chai from 'chai';
-import * as nock from 'nock';
 import * as sinon from 'sinon';
 import * as sinonChai from 'sinon-chai';
 import * as chaiAsPromised from 'chai-as-promised';
@@ -29,17 +26,33 @@ import * as chaiAsPromised from 'chai-as-promised';
 import * as utils from './utils';
 import * as mocks from '../resources/mocks';
 
-import {ApplicationDefaultCredential, CertCredential, GoogleOAuthAccessToken} from '../../src/auth/credential';
-import {FirebaseServiceInterface} from '../../src/firebase-service';
-import {FirebaseApp, FirebaseAccessToken} from '../../src/firebase-app';
-import {FirebaseNamespace, FirebaseNamespaceInternals, FIREBASE_CONFIG_VAR} from '../../src/firebase-namespace';
+import { GoogleOAuthAccessToken } from '../../src/credential/index';
+import { ServiceAccountCredential } from '../../src/credential/credential-internal';
+import { FirebaseApp, FirebaseAccessToken } from '../../src/firebase-app';
+import { FirebaseNamespace, FirebaseNamespaceInternals, FIREBASE_CONFIG_VAR } from '../../src/firebase-namespace';
 
-import {Auth} from '../../src/auth/auth';
-import {Messaging} from '../../src/messaging/messaging';
-import {Storage} from '../../src/storage/storage';
-import {Firestore} from '@google-cloud/firestore';
-import {Database} from '@firebase/database';
-import {InstanceId} from '../../src/instance-id/instance-id';
+import { auth } from '../../src/auth/index';
+import { messaging } from '../../src/messaging/index';
+import { machineLearning } from '../../src/machine-learning/index';
+import { storage } from '../../src/storage/index';
+import { firestore } from '../../src/firestore/index';
+import { database } from '../../src/database/index';
+import { instanceId } from '../../src/instance-id/index';
+import { projectManagement } from '../../src/project-management/index';
+import { securityRules } from '../../src/security-rules/index';
+import { remoteConfig } from '../../src/remote-config/index';
+import { FirebaseAppError, AppErrorCodes } from '../../src/utils/error';
+
+import Auth = auth.Auth;
+import Database = database.Database;
+import Messaging = messaging.Messaging;
+import MachineLearning = machineLearning.MachineLearning;
+import Storage = storage.Storage;
+import Firestore = firestore.Firestore;
+import InstanceId = instanceId.InstanceId;
+import ProjectManagement = projectManagement.ProjectManagement;
+import SecurityRules = securityRules.SecurityRules;
+import RemoteConfig = remoteConfig.RemoteConfig;
 
 chai.should();
 chai.use(sinonChai);
@@ -51,27 +64,32 @@ const ONE_HOUR_IN_SECONDS = 60 * 60;
 const ONE_MINUTE_IN_MILLISECONDS = 60 * 1000;
 
 const deleteSpy = sinon.spy();
-function mockServiceFactory(app: FirebaseApp): FirebaseServiceInterface {
-  return {
-    app,
-    INTERNAL: {
-      delete: deleteSpy.bind(null, app.name),
-    },
-  };
+
+class TestService {
+  public deleted = false;
+
+  public delete(): Promise<void> {
+    this.deleted = true;
+    return Promise.resolve();
+  }
 }
 
 
 describe('FirebaseApp', () => {
   let mockApp: FirebaseApp;
-  let mockedRequests: nock.Scope[] = [];
+  let clock: sinon.SinonFakeTimers;
+  let getTokenStub: sinon.SinonStub;
   let firebaseNamespace: FirebaseNamespace;
   let firebaseNamespaceInternals: FirebaseNamespaceInternals;
-  let firebaseConfigVar: string;
+  let firebaseConfigVar: string | undefined;
 
   beforeEach(() => {
-    utils.mockFetchAccessTokenRequests();
+    getTokenStub = sinon.stub(ServiceAccountCredential.prototype, 'getAccessToken').resolves({
+      access_token: 'mock-access-token', // eslint-disable-line @typescript-eslint/camelcase
+      expires_in: 3600, // eslint-disable-line @typescript-eslint/camelcase
+    });
 
-    this.clock = sinon.useFakeTimers(1000);
+    clock = sinon.useFakeTimers(1000);
 
     mockApp = mocks.app();
 
@@ -85,7 +103,8 @@ describe('FirebaseApp', () => {
   });
 
   afterEach(() => {
-    this.clock.restore();
+    getTokenStub.restore();
+    clock.restore();
     if (firebaseConfigVar) {
       process.env[FIREBASE_CONFIG_VAR] = firebaseConfigVar;
     } else {
@@ -94,11 +113,6 @@ describe('FirebaseApp', () => {
 
     deleteSpy.resetHistory();
     (firebaseNamespaceInternals.removeApp as any).restore();
-
-    _.forEach(mockedRequests, (mockedRequest) => mockedRequest.done());
-    mockedRequests = [];
-
-    nock.cleanAll();
   });
 
   describe('#name', () => {
@@ -131,7 +145,7 @@ describe('FirebaseApp', () => {
     it('should be read-only', () => {
       expect(() => {
         (mockApp as any).name = 'foo';
-      }).to.throw(`Cannot set property name of #<FirebaseApp> which has only a getter`);
+      }).to.throw('Cannot set property name of #<FirebaseApp> which has only a getter');
     });
   });
 
@@ -151,7 +165,7 @@ describe('FirebaseApp', () => {
     it('should be read-only', () => {
       expect(() => {
         (mockApp as any).options = {};
-      }).to.throw(`Cannot set property options of #<FirebaseApp> which has only a getter`);
+      }).to.throw('Cannot set property options of #<FirebaseApp> which has only a getter');
     });
 
     it('should not return an object which can mutate the underlying options', () => {
@@ -173,28 +187,28 @@ describe('FirebaseApp', () => {
       process.env[FIREBASE_CONFIG_VAR] = './test/resources/non_existant.json';
       expect(() => {
         firebaseNamespace.initializeApp();
-      }).to.throw(`Failed to parse app options file: Error: ENOENT: no such file or directory`);
+      }).to.throw('Failed to parse app options file: Error: ENOENT: no such file or directory');
     });
 
     it('should throw when the environment variable contains bad json', () => {
       process.env[FIREBASE_CONFIG_VAR] = '{,,';
       expect(() => {
         firebaseNamespace.initializeApp();
-      }).to.throw(`Failed to parse app options file: SyntaxError: Unexpected token ,`);
+      }).to.throw('Failed to parse app options file: SyntaxError: Unexpected token ,');
     });
 
     it('should throw when the environment variable points to an empty file', () => {
       process.env[FIREBASE_CONFIG_VAR] = './test/resources/firebase_config_empty.json';
       expect(() => {
         firebaseNamespace.initializeApp();
-      }).to.throw(`Failed to parse app options file`);
+      }).to.throw('Failed to parse app options file');
     });
 
     it('should throw when the environment variable points to bad json', () => {
       process.env[FIREBASE_CONFIG_VAR] = './test/resources/firebase_config_bad.json';
       expect(() => {
         firebaseNamespace.initializeApp();
-      }).to.throw(`Failed to parse app options file`);
+      }).to.throw('Failed to parse app options file');
     });
 
     it('should ignore a bad config key in the config file', () => {
@@ -244,7 +258,7 @@ describe('FirebaseApp', () => {
     it('should use explicitly specified options when available and ignore the config file', () => {
       process.env[FIREBASE_CONFIG_VAR] = './test/resources/firebase_config.json';
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
-      expect(app.options.credential).to.be.instanceOf(CertCredential);
+      expect(app.options.credential).to.be.instanceOf(ServiceAccountCredential);
       expect(app.options.databaseAuthVariableOverride).to.be.undefined;
       expect(app.options.databaseURL).to.equal('https://databaseName.firebaseio.com');
       expect(app.options.projectId).to.be.undefined;
@@ -261,7 +275,7 @@ describe('FirebaseApp', () => {
 
     it('should not throw when the config environment variable is not set, and some options are present', () => {
       const app = firebaseNamespace.initializeApp(mocks.appOptionsNoDatabaseUrl, mocks.appName);
-      expect(app.options.credential).to.be.instanceOf(CertCredential);
+      expect(app.options.credential).to.be.instanceOf(ServiceAccountCredential);
       expect(app.options.databaseURL).to.be.undefined;
       expect(app.options.projectId).to.be.undefined;
       expect(app.options.storageBucket).to.be.undefined;
@@ -269,7 +283,7 @@ describe('FirebaseApp', () => {
 
     it('should init with application default creds when no options provided and env variable is not set', () => {
       const app = firebaseNamespace.initializeApp();
-      expect(app.options.credential).to.be.instanceOf(ApplicationDefaultCredential);
+      expect(app.options.credential).to.not.be.undefined;
       expect(app.options.databaseURL).to.be.undefined;
       expect(app.options.projectId).to.be.undefined;
       expect(app.options.storageBucket).to.be.undefined;
@@ -278,7 +292,7 @@ describe('FirebaseApp', () => {
     it('should init with application default creds when no options provided and env variable is an empty json', () => {
       process.env[FIREBASE_CONFIG_VAR] = '{}';
       const app = firebaseNamespace.initializeApp();
-      expect(app.options.credential).to.be.instanceOf(ApplicationDefaultCredential);
+      expect(app.options.credential).to.not.be.undefined;
       expect(app.options.databaseURL).to.be.undefined;
       expect(app.options.projectId).to.be.undefined;
       expect(app.options.storageBucket).to.be.undefined;
@@ -287,7 +301,7 @@ describe('FirebaseApp', () => {
     it('should init when no init arguments are provided and config var points to a file', () => {
       process.env[FIREBASE_CONFIG_VAR] = './test/resources/firebase_config.json';
       const app = firebaseNamespace.initializeApp();
-      expect(app.options.credential).to.be.instanceOf(ApplicationDefaultCredential);
+      expect(app.options.credential).to.not.be.undefined;
       expect(app.options.databaseAuthVariableOverride).to.deep.equal({ 'some#key': 'some#val' });
       expect(app.options.databaseURL).to.equal('https://hipster-chat.firebaseio.mock');
       expect(app.options.projectId).to.equal('hipster-chat-mock');
@@ -302,7 +316,7 @@ describe('FirebaseApp', () => {
         "storageBucket": "hipster-chat.appspot.mock"
       }`;
       const app = firebaseNamespace.initializeApp();
-      expect(app.options.credential).to.be.instanceOf(ApplicationDefaultCredential);
+      expect(app.options.credential).to.not.be.undefined;
       expect(app.options.databaseAuthVariableOverride).to.deep.equal({ 'some#key': 'some#val' });
       expect(app.options.databaseURL).to.equal('https://hipster-chat.firebaseio.mock');
       expect(app.options.projectId).to.equal('hipster-chat-mock');
@@ -328,18 +342,15 @@ describe('FirebaseApp', () => {
     });
 
     it('should call delete() on each service\'s internals', () => {
-      firebaseNamespace.INTERNAL.registerService(mocks.serviceName, mockServiceFactory);
-      firebaseNamespace.INTERNAL.registerService(mocks.serviceName + '2', mockServiceFactory);
-
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
-
-      app[mocks.serviceName]();
-      app[mocks.serviceName + '2']();
+      const svc1 = new TestService();
+      const svc2 = new TestService();
+      (app as any).ensureService_(mocks.serviceName, () => svc1);
+      (app as any).ensureService_(mocks.serviceName + '2', () => svc2);
 
       return app.delete().then(() => {
-        expect(deleteSpy).to.have.been.calledTwice;
-        expect(deleteSpy.firstCall.args).to.deep.equal([mocks.appName]);
-        expect(deleteSpy.secondCall.args).to.deep.equal([mocks.appName]);
+        expect(svc1.deleted).to.be.true;
+        expect(svc2.deleted).to.be.true;
       });
     });
   });
@@ -393,6 +404,32 @@ describe('FirebaseApp', () => {
       const serviceNamespace1: Messaging = app.messaging();
       const serviceNamespace2: Messaging = app.messaging();
       expect(serviceNamespace1).to.deep.equal(serviceNamespace2);
+    });
+  });
+
+  describe('machineLearning()', () => {
+    it('should throw if the app has already been deleted', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+
+      return app.delete().then(() => {
+        expect(() => {
+          return app.machineLearning();
+        }).to.throw(`Firebase app named "${mocks.appName}" has already been deleted.`);
+      });
+    });
+
+    it('should return the machineLearning client', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+
+      const machineLearning: MachineLearning = app.machineLearning();
+      expect(machineLearning).to.not.be.null;
+    });
+
+    it('should return a cached version of MachineLearning on subsequent calls', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+      const service1: MachineLearning = app.machineLearning();
+      const service2: MachineLearning = app.machineLearning();
+      expect(service1).to.equal(service2);
     });
   });
 
@@ -497,7 +534,7 @@ describe('FirebaseApp', () => {
       expect(gcsNamespace).not.be.null;
     });
 
-    it('should return a cached version of Messaging on subsequent calls', () => {
+    it('should return a cached version of Storage on subsequent calls', () => {
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
       const serviceNamespace1: Storage = app.storage();
       const serviceNamespace2: Storage = app.storage();
@@ -557,65 +594,85 @@ describe('FirebaseApp', () => {
     });
   });
 
-  describe('#[service]()', () => {
+  describe('projectManagement()', () => {
     it('should throw if the app has already been deleted', () => {
-      firebaseNamespace.INTERNAL.registerService(mocks.serviceName, mockServiceFactory);
-
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
 
       return app.delete().then(() => {
         expect(() => {
-          return app[mocks.serviceName]();
+          return app.projectManagement();
         }).to.throw(`Firebase app named "${mocks.appName}" has already been deleted.`);
       });
     });
 
-    it('should return the service namespace', () => {
-      firebaseNamespace.INTERNAL.registerService(mocks.serviceName, mockServiceFactory);
-
+    it('should return the projectManagement client', () => {
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
 
-      const serviceNamespace = app[mocks.serviceName]();
-      expect(serviceNamespace).to.have.keys(['app', 'INTERNAL']);
+      const projectManagement: ProjectManagement = app.projectManagement();
+      expect(projectManagement).to.not.be.null;
     });
 
-    it('should return a cached version of the service on subsequent calls', () => {
-      const createServiceSpy = sinon.spy();
-      firebaseNamespace.INTERNAL.registerService(mocks.serviceName, createServiceSpy);
+    it('should return a cached version of ProjectManagement on subsequent calls', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+      const service1: ProjectManagement = app.projectManagement();
+      const service2: ProjectManagement = app.projectManagement();
+      expect(service1).to.equal(service2);
+    });
+  });
 
+  describe('securityRules()', () => {
+    it('should throw if the app has already been deleted', () => {
       const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
 
-      expect(createServiceSpy).to.not.have.been.called;
+      return app.delete().then(() => {
+        expect(() => {
+          return app.securityRules();
+        }).to.throw(`Firebase app named "${mocks.appName}" has already been deleted.`);
+      });
+    });
 
-      const serviceNamespace1 = app[mocks.serviceName]();
-      expect(createServiceSpy).to.have.been.calledOnce;
+    it('should return the securityRules client', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
 
-      const serviceNamespace2 = app[mocks.serviceName]();
-      expect(createServiceSpy).to.have.been.calledOnce;
-      expect(serviceNamespace1).to.deep.equal(serviceNamespace2);
+      const securityRules: SecurityRules = app.securityRules();
+      expect(securityRules).to.not.be.null;
+    });
+
+    it('should return a cached version of SecurityRules on subsequent calls', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+      const service1: SecurityRules = app.securityRules();
+      const service2: SecurityRules = app.securityRules();
+      expect(service1).to.equal(service2);
+    });
+  });
+
+  describe('remoteConfig()', () => {
+    it('should throw if the app has already been deleted', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+
+      return app.delete().then(() => {
+        expect(() => {
+          return app.remoteConfig();
+        }).to.throw(`Firebase app named "${mocks.appName}" has already been deleted.`);
+      });
+    });
+
+    it('should return the RemoteConfig client', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+
+      const remoteConfig: RemoteConfig = app.remoteConfig();
+      expect(remoteConfig).to.not.be.null;
+    });
+
+    it('should return a cached version of RemoteConfig on subsequent calls', () => {
+      const app = firebaseNamespace.initializeApp(mocks.appOptions, mocks.appName);
+      const service1: RemoteConfig = app.remoteConfig();
+      const service2: RemoteConfig = app.remoteConfig();
+      expect(service1).to.equal(service2);
     });
   });
 
   describe('INTERNAL.getToken()', () => {
-    let httpsSpy: sinon.SinonSpy;
-    let getAccessTokenSpy: sinon.SinonSpy;
-    let getAccessTokenStub: sinon.SinonStub;
-
-    beforeEach(() => {
-      httpsSpy = sinon.spy(https, 'request');
-    });
-
-    afterEach(() => {
-      httpsSpy.restore();
-
-      if (typeof getAccessTokenSpy !== 'undefined') {
-        getAccessTokenSpy.restore();
-      }
-
-      if (typeof getAccessTokenStub !== 'undefined') {
-        getAccessTokenStub.restore();
-      }
-    });
 
     it('throws a custom credential implementation which returns invalid access tokens', () => {
       const credential = {
@@ -635,14 +692,14 @@ describe('FirebaseApp', () => {
 
     it('returns a valid token given a well-formed custom credential implementation', () => {
       const oracle: GoogleOAuthAccessToken = {
-        access_token: 'This is a custom token',
-        expires_in: ONE_HOUR_IN_SECONDS,
+        access_token: 'This is a custom token', // eslint-disable-line @typescript-eslint/camelcase
+        expires_in: ONE_HOUR_IN_SECONDS, // eslint-disable-line @typescript-eslint/camelcase
       };
       const credential = {
         getAccessToken: () => Promise.resolve(oracle),
       };
 
-      const app = utils.createAppWithOptions({credential});
+      const app = utils.createAppWithOptions({ credential });
 
       return app.INTERNAL.getToken().then((token) => {
         expect(token.accessToken).to.equal(oracle.access_token);
@@ -668,20 +725,20 @@ describe('FirebaseApp', () => {
 
     it('returns the cached token given no arguments', () => {
       return mockApp.INTERNAL.getToken(true).then((token1) => {
-        this.clock.tick(1000);
+        clock.tick(1000);
         return mockApp.INTERNAL.getToken().then((token2) => {
           expect(token1).to.deep.equal(token2);
-          expect(httpsSpy).to.have.been.calledOnce;
+          expect(getTokenStub).to.have.been.calledOnce;
         });
       });
     });
 
     it('returns a new token with force refresh', () => {
       return mockApp.INTERNAL.getToken(true).then((token1) => {
-        this.clock.tick(1000);
+        clock.tick(1000);
         return mockApp.INTERNAL.getToken(true).then((token2) => {
           expect(token1).to.not.deep.equal(token2);
-          expect(httpsSpy).to.have.been.calledTwice;
+          expect(getTokenStub).to.have.been.calledTwice;
         });
       });
     });
@@ -691,20 +748,20 @@ describe('FirebaseApp', () => {
       return mockApp.INTERNAL.getToken(true).then((token1) => {
         // Forward the clock to five minutes and one second before expiry.
         const expiryInMilliseconds = token1.expirationTime - Date.now();
-        this.clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS) - 1000);
+        clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS) - 1000);
 
         return mockApp.INTERNAL.getToken().then((token2) => {
           // Ensure the token has not been proactively refreshed.
           expect(token1).to.deep.equal(token2);
-          expect(httpsSpy).to.have.been.calledOnce;
+          expect(getTokenStub).to.have.been.calledOnce;
 
           // Forward the clock to exactly five minutes before expiry.
-          this.clock.tick(1000);
+          clock.tick(1000);
 
           return mockApp.INTERNAL.getToken().then((token3) => {
             // Ensure the token was proactively refreshed.
             expect(token1).to.not.deep.equal(token3);
-            expect(httpsSpy).to.have.been.calledTwice;
+            expect(getTokenStub).to.have.been.calledTwice;
           });
         });
       });
@@ -714,32 +771,37 @@ describe('FirebaseApp', () => {
       // Force a token refresh.
       return mockApp.INTERNAL.getToken(true).then((token1) => {
         // Stub the getToken() method to return a rejected promise.
-        getAccessTokenStub = sinon.stub(mockApp.options.credential, 'getAccessToken');
-        getAccessTokenStub.returns(Promise.reject(new Error('Intentionally rejected')));
+        getTokenStub.restore();
+        expect(mockApp.options.credential).to.exist;
+        getTokenStub = sinon.stub(mockApp.options.credential!, 'getAccessToken')
+          .rejects(new Error('Intentionally rejected'));
 
         // Forward the clock to exactly five minutes before expiry.
         const expiryInMilliseconds = token1.expirationTime - Date.now();
-        this.clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
+        clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
 
         // Forward the clock to exactly four minutes before expiry.
-        this.clock.tick(60 * 1000);
+        clock.tick(60 * 1000);
 
         // Restore the stubbed getAccessToken() method.
-        getAccessTokenStub.restore();
-        getAccessTokenStub = undefined;
+        getTokenStub.restore();
+        getTokenStub = sinon.stub(ServiceAccountCredential.prototype, 'getAccessToken').resolves({
+          access_token: 'mock-access-token', // eslint-disable-line @typescript-eslint/camelcase
+          expires_in: 3600, // eslint-disable-line @typescript-eslint/camelcase
+        });
 
         return mockApp.INTERNAL.getToken().then((token2) => {
           // Ensure the token has not been proactively refreshed.
           expect(token1).to.deep.equal(token2);
-          expect(httpsSpy).to.have.been.calledOnce;
+          expect(getTokenStub).to.have.not.been.called;
 
           // Forward the clock to exactly three minutes before expiry.
-          this.clock.tick(60 * 1000);
+          clock.tick(60 * 1000);
 
           return mockApp.INTERNAL.getToken().then((token3) => {
             // Ensure the token was proactively refreshed.
             expect(token1).to.not.deep.equal(token3);
-            expect(httpsSpy).to.have.been.calledTwice;
+            expect(getTokenStub).to.have.been.calledOnce;
           });
         });
       });
@@ -747,20 +809,22 @@ describe('FirebaseApp', () => {
 
     it('stops retrying to proactively refresh the token after five attempts', () => {
       // Force a token refresh.
-      let originalToken;
+      let originalToken: FirebaseAccessToken;
       return mockApp.INTERNAL.getToken(true).then((token) => {
         originalToken = token;
 
         // Stub the credential's getAccessToken() method to always return a rejected promise.
-        getAccessTokenStub = sinon.stub(mockApp.options.credential, 'getAccessToken');
-        getAccessTokenStub.returns(Promise.reject(new Error('Intentionally rejected')));
+        getTokenStub.restore();
+        expect(mockApp.options.credential).to.exist;
+        getTokenStub = sinon.stub(mockApp.options.credential!, 'getAccessToken')
+          .rejects(new Error('Intentionally rejected'));
 
         // Expect the call count to initially be zero.
-        expect(getAccessTokenStub.callCount).to.equal(0);
+        expect(getTokenStub.callCount).to.equal(0);
 
         // Forward the clock to exactly five minutes before expiry.
         const expiryInMilliseconds = token.expirationTime - Date.now();
-        this.clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
+        clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
 
         // Due to synchronous timing issues when the timer is mocked, make a call to getToken()
         // without forcing a refresh to ensure there is enough time for the underlying token refresh
@@ -768,67 +832,67 @@ describe('FirebaseApp', () => {
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was attempted to be proactively refreshed one time.
-        expect(getAccessTokenStub.callCount).to.equal(1);
+        expect(getTokenStub.callCount).to.equal(1);
 
         // Ensure the proactive refresh failed.
         expect(token).to.deep.equal(originalToken);
 
         // Forward the clock to four minutes before expiry.
-        this.clock.tick(ONE_MINUTE_IN_MILLISECONDS);
+        clock.tick(ONE_MINUTE_IN_MILLISECONDS);
 
         // See note above about calling getToken().
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was attempted to be proactively refreshed two times.
-        expect(getAccessTokenStub.callCount).to.equal(2);
+        expect(getTokenStub.callCount).to.equal(2);
 
         // Ensure the proactive refresh failed.
         expect(token).to.deep.equal(originalToken);
 
         // Forward the clock to three minutes before expiry.
-        this.clock.tick(ONE_MINUTE_IN_MILLISECONDS);
+        clock.tick(ONE_MINUTE_IN_MILLISECONDS);
 
         // See note above about calling getToken().
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was attempted to be proactively refreshed three times.
-        expect(getAccessTokenStub.callCount).to.equal(3);
+        expect(getTokenStub.callCount).to.equal(3);
 
         // Ensure the proactive refresh failed.
         expect(token).to.deep.equal(originalToken);
 
         // Forward the clock to two minutes before expiry.
-        this.clock.tick(ONE_MINUTE_IN_MILLISECONDS);
+        clock.tick(ONE_MINUTE_IN_MILLISECONDS);
 
         // See note above about calling getToken().
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was attempted to be proactively refreshed four times.
-        expect(getAccessTokenStub.callCount).to.equal(4);
+        expect(getTokenStub.callCount).to.equal(4);
 
         // Ensure the proactive refresh failed.
         expect(token).to.deep.equal(originalToken);
 
         // Forward the clock to one minute before expiry.
-        this.clock.tick(ONE_MINUTE_IN_MILLISECONDS);
+        clock.tick(ONE_MINUTE_IN_MILLISECONDS);
 
         // See note above about calling getToken().
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was attempted to be proactively refreshed five times.
-        expect(getAccessTokenStub.callCount).to.equal(5);
+        expect(getTokenStub.callCount).to.equal(5);
 
         // Ensure the proactive refresh failed.
         expect(token).to.deep.equal(originalToken);
 
         // Forward the clock to expiry.
-        this.clock.tick(ONE_MINUTE_IN_MILLISECONDS);
+        clock.tick(ONE_MINUTE_IN_MILLISECONDS);
 
         // See note above about calling getToken().
         return mockApp.INTERNAL.getToken();
       }).then((token) => {
         // Ensure the token was not attempted to be proactively refreshed a sixth time.
-        expect(getAccessTokenStub.callCount).to.equal(5);
+        expect(getTokenStub.callCount).to.equal(5);
 
         // Ensure the token has never been refresh.
         expect(token).to.deep.equal(originalToken);
@@ -838,32 +902,32 @@ describe('FirebaseApp', () => {
     it('resets the proactive refresh timeout upon a force refresh', () => {
       // Force a token refresh.
       return mockApp.INTERNAL.getToken(true).then((token1) => {
-         // Forward the clock to five minutes and one second before expiry.
+        // Forward the clock to five minutes and one second before expiry.
         let expiryInMilliseconds = token1.expirationTime - Date.now();
-        this.clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS) - 1000);
+        clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS) - 1000);
 
         // Force a token refresh.
         return mockApp.INTERNAL.getToken(true).then((token2) => {
           // Ensure the token was force refreshed.
           expect(token1).to.not.deep.equal(token2);
-          expect(httpsSpy).to.have.been.calledTwice;
+          expect(getTokenStub).to.have.been.calledTwice;
 
           // Forward the clock to exactly five minutes before the original token's expiry.
-          this.clock.tick(1000);
+          clock.tick(1000);
 
           return mockApp.INTERNAL.getToken().then((token3) => {
             // Ensure the token hasn't changed, meaning the proactive refresh was canceled.
             expect(token2).to.deep.equal(token3);
-            expect(httpsSpy).to.have.been.calledTwice;
+            expect(getTokenStub).to.have.been.calledTwice;
 
             // Forward the clock to exactly five minutes before the refreshed token's expiry.
             expiryInMilliseconds = token3.expirationTime - Date.now();
-            this.clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
+            clock.tick(expiryInMilliseconds - (5 * ONE_MINUTE_IN_MILLISECONDS));
 
             return mockApp.INTERNAL.getToken().then((token4) => {
               // Ensure the token was proactively refreshed.
               expect(token3).to.not.deep.equal(token4);
-              expect(httpsSpy).to.have.been.calledThrice;
+              expect(getTokenStub).to.have.been.calledThrice;
             });
           });
         });
@@ -872,30 +936,58 @@ describe('FirebaseApp', () => {
 
     it('proactively refreshes the token at the next full minute if it expires in five minutes or less', () => {
       // Turn off default mocking of one hour access tokens and replace it with a short-lived token.
-      nock.cleanAll();
-      utils.mockFetchAccessTokenRequests(/* token */ undefined, /* expiresIn */ 3 * 60 + 10);
+      getTokenStub.restore();
+      expect(mockApp.options.credential).to.exist;
+      getTokenStub = sinon.stub(mockApp.options.credential!, 'getAccessToken').resolves({
+        access_token: utils.generateRandomAccessToken(), // eslint-disable-line @typescript-eslint/camelcase
+        expires_in: 3 * 60 + 10, // eslint-disable-line @typescript-eslint/camelcase
+      });
+      // Expect the call count to initially be zero.
+      expect(getTokenStub.callCount).to.equal(0);
 
       // Force a token refresh.
       return mockApp.INTERNAL.getToken(true).then((token1) => {
-        getAccessTokenSpy = sinon.spy(mockApp.options.credential, 'getAccessToken');
 
         // Move the clock forward to three minutes and one second before expiry.
-        this.clock.tick(9 * 1000);
-
-        // Expect the call count to initially be zero.
-        expect(getAccessTokenSpy.callCount).to.equal(0);
+        clock.tick(9 * 1000);
+        expect(getTokenStub.callCount).to.equal(1);
 
         // Move the clock forward to exactly three minutes before expiry.
-        this.clock.tick(1000);
+        clock.tick(1000);
 
         // Expect the underlying getAccessToken() method to have been called once.
-        expect(getAccessTokenSpy.callCount).to.equal(1);
+        expect(getTokenStub.callCount).to.equal(2);
 
         return mockApp.INTERNAL.getToken().then((token2) => {
           // Ensure the token was proactively refreshed.
           expect(token1).to.not.deep.equal(token2);
         });
       });
+    });
+
+    it('Includes the original error in exception', () => {
+      getTokenStub.restore();
+      const mockError = new FirebaseAppError(
+        AppErrorCodes.INVALID_CREDENTIAL, 'Something went wrong');
+      getTokenStub = sinon.stub(ServiceAccountCredential.prototype, 'getAccessToken').rejects(mockError);
+      const detailedMessage = 'Credential implementation provided to initializeApp() via the "credential" property'
+        + ' failed to fetch a valid Google OAuth2 access token with the following error: "Something went wrong".';
+      expect(mockApp.INTERNAL.getToken(true)).to.be.rejectedWith(detailedMessage);
+    });
+
+    it('Returns a detailed message when an error is due to an invalid_grant', () => {
+      getTokenStub.restore();
+      const mockError = new FirebaseAppError(
+        AppErrorCodes.INVALID_CREDENTIAL, 'Failed to get credentials: invalid_grant (reason)');
+      getTokenStub = sinon.stub(ServiceAccountCredential.prototype, 'getAccessToken').rejects(mockError);
+      const detailedMessage = 'Credential implementation provided to initializeApp() via the "credential" property'
+        + ' failed to fetch a valid Google OAuth2 access token with the following error: "Failed to get credentials:'
+        + ' invalid_grant (reason)". There are two likely causes: (1) your server time is not properly synced or (2)'
+        + ' your certificate key file has been revoked. To solve (1), re-sync the time on your server. To solve (2),'
+        + ' make sure the key ID for your key file is still present at '
+        + 'https://console.firebase.google.com/iam-admin/serviceaccounts/project. If not, generate a new key file '
+        + 'at https://console.firebase.google.com/project/_/settings/serviceaccounts/adminsdk.';
+      expect(mockApp.INTERNAL.getToken(true)).to.be.rejectedWith(detailedMessage);
     });
   });
 
@@ -935,7 +1027,7 @@ describe('FirebaseApp', () => {
       return mockApp.INTERNAL.getToken().then((token: FirebaseAccessToken) => {
         expect(addAuthTokenListenerSpy).to.have.been.calledOnce.and.calledWith(token.accessToken);
 
-        this.clock.tick(1000);
+        clock.tick(1000);
 
         return mockApp.INTERNAL.getToken(true);
       }).then((token: FirebaseAccessToken) => {
@@ -977,7 +1069,7 @@ describe('FirebaseApp', () => {
 
         mockApp.INTERNAL.removeAuthTokenListener(addAuthTokenListenerSpies[0]);
 
-        this.clock.tick(1000);
+        clock.tick(1000);
 
         return mockApp.INTERNAL.getToken(true);
       }).then((token: FirebaseAccessToken) => {

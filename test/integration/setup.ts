@@ -18,12 +18,11 @@ import * as admin from '../../lib/index';
 import fs = require('fs');
 import minimist = require('minimist');
 import path = require('path');
-import {random} from 'lodash';
-import { Credential, CertCredential, GoogleOAuthAccessToken, Certificate } from '../../src/auth/credential';
+import { random } from 'lodash';
+import { GoogleOAuthAccessToken } from '../../src/credential/index';
 
-/* tslint:disable:no-var-requires */
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const chalk = require('chalk');
-/* tslint:enable:no-var-requires */
 
 export let databaseUrl: string;
 export let storageBucket: string;
@@ -37,51 +36,72 @@ export let noServiceAccountApp: admin.app.App;
 
 export let cmdArgs: any;
 
-before(() => {
-  /* tslint:disable:no-console */
-  let serviceAccount: any;
-  try {
-    serviceAccount = require('../resources/key.json');
-  } catch (error) {
-    console.log(chalk.red(
-      'The integration test suite requires a service account JSON file for a ' +
-      'Firebase project to be saved to `test/resources/key.json`.',
-      error,
-    ));
-    throw error;
-  }
+export const isEmulator = !!process.env.FIREBASE_EMULATOR_HUB;
 
-  try {
-    apiKey = fs.readFileSync(path.join(__dirname, '../resources/apikey.txt')).toString().trim();
-  } catch (error) {
-    console.log(chalk.red(
-      'The integration test suite requires an API key for a ' +
-      'Firebase project to be saved to `test/resources/apikey.txt`.',
-      error,
+before(() => {
+  let getCredential: () => {credential?: admin.credential.Credential};
+  let serviceAccountId: string;
+
+  /* tslint:disable:no-console */
+  if (isEmulator) {
+    console.log(chalk.yellow(
+      'Running integration tests against Emulator Suite. ' +
+      'Some tests may be skipped due to lack of emulator support.',
     ));
-    throw error;
+    getCredential = () => ({});
+    projectId = process.env.GCLOUD_PROJECT!;
+    apiKey = 'fake-api-key';
+    serviceAccountId = 'fake-client-email@example.com';
+  } else {
+    let serviceAccount: any;
+    try {
+      serviceAccount = require('../resources/key.json');
+    } catch (error) {
+      console.log(chalk.red(
+        'The integration test suite requires a service account JSON file for a ' +
+        'Firebase project to be saved to `test/resources/key.json`.',
+        error,
+      ));
+      throw error;
+    }
+
+    try {
+      apiKey = fs.readFileSync(path.join(__dirname, '../resources/apikey.txt')).toString().trim();
+    } catch (error) {
+      console.log(chalk.red(
+        'The integration test suite requires an API key for a ' +
+        'Firebase project to be saved to `test/resources/apikey.txt`.',
+        error,
+      ));
+      throw error;
+    }
+    getCredential = () => ({ credential: admin.credential.cert(serviceAccount) });
+    projectId = serviceAccount.project_id;
+    serviceAccountId = serviceAccount.client_email;
   }
   /* tslint:enable:no-console */
 
-  projectId = serviceAccount.project_id;
   databaseUrl = 'https://' + projectId + '.firebaseio.com';
   storageBucket = projectId + '.appspot.com';
 
   defaultApp = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    ...getCredential(),
+    projectId,
     databaseURL: databaseUrl,
     storageBucket,
   });
 
   nullApp = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    ...getCredential(),
+    projectId,
     databaseURL: databaseUrl,
     databaseAuthVariableOverride: null,
     storageBucket,
   }, 'null');
 
   nonNullApp = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    ...getCredential(),
+    projectId,
     databaseURL: databaseUrl,
     databaseAuthVariableOverride: {
       uid: generateRandomString(20),
@@ -89,16 +109,30 @@ before(() => {
     storageBucket,
   }, 'nonNull');
 
+  const noServiceAccountAppCreds = getCredential();
+  if (noServiceAccountAppCreds.credential) {
+    noServiceAccountAppCreds.credential = new CertificatelessCredential(
+      noServiceAccountAppCreds.credential)
+  }
   noServiceAccountApp = admin.initializeApp({
-    credential: new CertificatelessCredential(admin.credential.cert(serviceAccount)),
-    serviceAccountId: serviceAccount.client_email,
+    ...noServiceAccountAppCreds,
+    serviceAccountId,
     projectId,
   }, 'noServiceAccount');
 
   cmdArgs = minimist(process.argv.slice(2));
 });
 
-class CertificatelessCredential implements Credential {
+after(() => {
+  return Promise.all([
+    defaultApp.delete(),
+    nullApp.delete(),
+    nonNullApp.delete(),
+    noServiceAccountApp.delete(),
+  ]);
+});
+
+class CertificatelessCredential implements admin.credential.Credential {
   private readonly delegate: admin.credential.Credential;
 
   constructor(delegate: admin.credential.Credential) {
@@ -108,20 +142,18 @@ class CertificatelessCredential implements Credential {
   public getAccessToken(): Promise<GoogleOAuthAccessToken> {
     return this.delegate.getAccessToken();
   }
-
-  public getCertificate(): Certificate {
-    return null;
-  }
 }
 
 /**
  * Generate a random string of the specified length, optionally using the specified alphabet.
  *
- * @param {number} length The length of the string to generate.
- * @return {string} A random string of the provided length.
+ * @param length The length of the string to generate.
+ * @param allowNumbers Whether to allow numbers in the generated string. The default is true.
+ * @return A random string of the provided length.
  */
-export function generateRandomString(length: number): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+export function generateRandomString(length: number, allowNumbers = true): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' +
+      (allowNumbers ? '0123456789' : '');
   let text = '';
   for (let i = 0; i < length; i++) {
     text += alphabet.charAt(random(alphabet.length - 1));
