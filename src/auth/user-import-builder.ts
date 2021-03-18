@@ -26,6 +26,8 @@ import UpdatePhoneMultiFactorInfoRequest = auth.UpdatePhoneMultiFactorInfoReques
 import UserImportRecord = auth.UserImportRecord;
 import UserImportOptions = auth.UserImportOptions;
 import UserImportResult = auth.UserImportResult;
+import HashInputOrderType = auth.HashInputOrderType;
+import PasswordHashOrderType = auth.PasswordHashOrderType;
 
 /** Interface representing an Auth second factor in Auth server format. */
 export interface AuthFactorInfo {
@@ -512,7 +514,7 @@ export class UserImportBuilder {
     populatedOptions: UploadAccountOptions,
     inputOrder?: HashInputOrderType,
   ): UploadAccountOptions {
-    const populatedOptionsCopy = {...populatedOptions};
+    const populatedOptionsCopy = { ...populatedOptions };
 
     if (typeof inputOrder !== 'undefined') {
       if (inputOrder !== 'SALT_FIRST' && inputOrder !== 'PASSWORD_FIRST') {

@@ -250,6 +250,7 @@ describe('UserImportBuilder', () => {
             hash: {
               algorithm,
               key: Buffer.from('secret'),
+              rounds: 10,
               inputOrder: 'INVALID_HASH_INPUT_ORDER',
             },
           };
@@ -329,7 +330,7 @@ describe('UserImportBuilder', () => {
             const invalidOptions = {
               hash: {
                 algorithm,
-                rounds: 120000,
+                rounds: 1,
                 inputOrder: 'INVALID_HASH_INPUT_ORDER',
               },
             };

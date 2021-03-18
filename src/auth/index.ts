@@ -672,6 +672,9 @@ export namespace auth {
   export type HashAlgorithmType = 'SCRYPT' | 'STANDARD_SCRYPT' | 'HMAC_SHA512' |
     'HMAC_SHA256' | 'HMAC_SHA1' | 'HMAC_MD5' | 'MD5' | 'PBKDF_SHA1' | 'BCRYPT' |
     'PBKDF2_SHA256' | 'SHA512' | 'SHA256' | 'SHA1';
+  /** Firebase Auth supported hashing input orders for import operations. */
+  export type HashInputOrderType = 'SALT_FIRST' | 'PASSWORD_FIRST';
+  export type PasswordHashOrderType = 'PASSWORD_AND_SALT' | 'SALT_AND_PASSWORD';
 
   /**
    * Interface representing the user import options needed for
@@ -736,6 +739,8 @@ export namespace auth {
        * `STANDARD_SCRYPT` algorithm.
        */
       derivedKeyLength?: number;
+
+      inputOrder?: HashInputOrderType;
     };
   }
 
